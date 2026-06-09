@@ -12,6 +12,7 @@ from job_scraper import JobScraper
 load_dotenv()
 
 app = FastAPI(title="Job Scraping API", version="1.0.0")
+API_MAX_JOBS = int(os.getenv("API_MAX_JOBS", "5"))
 
 # Configure CORS origins based on environment
 DEVELOPMENT_ORIGINS = [
@@ -61,6 +62,7 @@ app.add_middleware(
 class ScrapeRequest(BaseModel):
     url: str
     max_jobs: Optional[int] = 3  # Maximum number of jobs to scrape (default 3)
+    include_html_content: bool = True  # Keep styled job HTML in API responses by default.
 
 class JobData(BaseModel):
     employer: Optional[str] = None
@@ -81,6 +83,8 @@ class JobData(BaseModel):
     interview_format: Optional[str] = None
     html_content: Optional[str] = None
     source_url: Optional[str] = None
+    category_id: Optional[str] = None
+    category_name: Optional[str] = None
 
 class ScrapeResponse(BaseModel):
     success: bool
@@ -101,14 +105,76 @@ async def cors_test():
         "cors_enabled": True
     }
 
-@app.post("/scrape", response_model=ScrapeResponse)
+def _compact_jobs_for_response(jobs):
+    """Remove empty fields and large internal payloads from API responses."""
+    compacted = []
+    for job in jobs:
+        compacted_job = {}
+        for key, value in job.items():
+            if key == "html_content":
+                continue
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            compacted_job[key] = value
+        compacted.append(compacted_job)
+    return compacted
+
+async def _get_scrape_db_context():
+    db = None
+    try:
+        from database import Database
+
+        db = Database()
+        await db.connect()
+        return {
+            "existing_source_urls": await db.get_scraped_source_urls(),
+            "categories": await db.get_categories(),
+        }
+    except Exception as e:
+        print(f"⚠️ Could not load scrape DB context; continuing without DB filters/categories: {e}")
+        return {"existing_source_urls": set(), "categories": []}
+    finally:
+        if db:
+            await db.close()
+
+@app.post("/scrape", response_model=ScrapeResponse, response_model_exclude_none=True)
 async def scrape_jobs(request: ScrapeRequest):
     try:
+        effective_max_jobs = request.max_jobs if request.max_jobs is not None else API_MAX_JOBS
+        effective_max_jobs = max(1, min(effective_max_jobs, API_MAX_JOBS))
+        scrape_context = await _get_scrape_db_context()
+        existing_source_urls = scrape_context["existing_source_urls"]
+        categories = scrape_context["categories"]
+
         # Initialize the job scraper
-        scraper = JobScraper()
+        scraper = JobScraper(
+            include_html_content=request.include_html_content,
+            fast_mode=True,
+            categories=categories,
+        )
         
         # Scrape jobs from the provided URL (limited by max_jobs)
-        jobs = await scraper.scrape_jobs(request.url, max_jobs=request.max_jobs)
+        jobs = await scraper.scrape_jobs(
+            request.url,
+            max_jobs=effective_max_jobs,
+            existing_source_urls=existing_source_urls,
+        )
+
+        if len(jobs) < effective_max_jobs:
+            fallback_scraper = JobScraper(
+                include_html_content=request.include_html_content,
+                fast_mode=False,
+                categories=categories,
+            )
+            fallback_jobs = await fallback_scraper.scrape_jobs(
+                request.url,
+                max_jobs=effective_max_jobs,
+                existing_source_urls=existing_source_urls,
+            )
+            if len(fallback_jobs) > len(jobs):
+                jobs = fallback_jobs
         
         if not jobs:
             return ScrapeResponse(
@@ -118,10 +184,12 @@ async def scrape_jobs(request: ScrapeRequest):
                 total_jobs=0
             )
         
+        response_jobs = jobs if request.include_html_content else _compact_jobs_for_response(jobs)
+
         return ScrapeResponse(
             success=True,
             message=f"Successfully scraped {len(jobs)} jobs",
-            jobs=jobs,
+            jobs=response_jobs,
             total_jobs=len(jobs)
         )
         

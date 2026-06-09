@@ -107,7 +107,9 @@ Scrapes jobs from a given URL.
 **Request Body:**
 ```json
 {
-  "url": "https://example.com/jobs"
+  "url": "https://example.com/jobs",
+  "max_jobs": 3,
+  "include_html_content": false
 }
 ```
 
@@ -143,6 +145,8 @@ Scrapes jobs from a given URL.
 
 - `OPENAI_API_KEY`: Your OpenAI API key (already set in the code)
 - `REACT_APP_API_URL`: Backend API URL (defaults to `http://localhost:8000`)
+- `SELENIUM_HTTP_READ_TIMEOUT`: Chromedriver command timeout. Fast API mode defaults to `60`; deep mode defaults to `120`.
+- `SKIP_MAIN_DOCUMENT_SCROLL`: Set to `true` to skip slow parent-page scrolling. API fast mode does this by default while still processing iframes/listings.
 
 ### Customization
 

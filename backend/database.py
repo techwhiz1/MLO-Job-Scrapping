@@ -96,12 +96,25 @@ class Database:
             return None
     
     async def get_scraped_source_urls(self, limit: Optional[int] = None) -> set:
-        """Get all source_urls from JobPost table that have been scraped"""
+        """Get all source URL values from JobPost table that have been scraped."""
         try:
             async with self.pool.acquire() as conn:
-                query = "SELECT DISTINCT source_url FROM \"JobPost\" WHERE source_url IS NOT NULL"
+                column_rows = await conn.fetch("""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = 'JobPost'
+                      AND column_name IN ('source_url', 'sourceURL')
+                """)
+                columns = [row["column_name"] for row in column_rows]
+                if not columns:
+                    logger.warning("No source_url/sourceURL column exists in JobPost table. Returning empty set.")
+                    return set()
+
+                source_expr = "COALESCE(" + ", ".join(f'"{column}"' for column in columns) + ")"
+                where_expr = " OR ".join(f'"{column}" IS NOT NULL' for column in columns)
+                query = f'SELECT DISTINCT {source_expr} AS source_url FROM "JobPost" WHERE {where_expr}'
                 if limit:
-                    query += f" LIMIT {limit}"
+                    query += f" LIMIT {int(limit)}"
                 rows = await conn.fetch(query)
                 source_urls = {row['source_url'] for row in rows if row['source_url']}
                 logger.info(f"Found {len(source_urls)} scraped source URLs")
@@ -113,6 +126,40 @@ class Database:
                 logger.warning("source_url column does not exist in JobPost table. Returning empty set.")
                 return set()
             raise
+
+    async def get_categories(self) -> List[Dict[str, Any]]:
+        """Fetch category rows for job classification."""
+        try:
+            async with self.pool.acquire() as conn:
+                table_name = await conn.fetchval("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = current_schema()
+                      AND table_name IN ('Categories', 'Category', 'categories', 'category')
+                    ORDER BY CASE table_name
+                        WHEN 'Categories' THEN 0
+                        WHEN 'Category' THEN 1
+                        WHEN 'categories' THEN 2
+                        ELSE 3
+                    END
+                    LIMIT 1
+                """)
+                if not table_name:
+                    logger.warning("Categories/Category table does not exist. Returning empty category list.")
+                    return []
+
+                rows = await conn.fetch(f'SELECT * FROM "{table_name}"')
+                categories = []
+                for row in rows:
+                    try:
+                        categories.append({key: row[key] for key in row.keys()})
+                    except (AttributeError, TypeError):
+                        categories.append(dict(row))
+                logger.info(f"Fetched {len(categories)} categories from {table_name}")
+                return categories
+        except Exception as e:
+            logger.error(f"Error fetching categories: {str(e)}")
+            return []
     
     async def insert_job_post(self, job_data: Dict[str, Any]) -> str:
         """
@@ -153,6 +200,7 @@ class Database:
             certification_level = job_data.get('certification_level', '') or job_data.get('certificationLevel', '')
             interview_format = job_data.get('interview_format', '') or job_data.get('interviewFormat', '')
             required_experience = job_data.get('required_experience', '') or job_data.get('requiredExperience', '')
+            category_id = job_data.get('category_id') or job_data.get('categoryId') or None
             # Use postedById from job_data, fallback to default if not provided
             posted_by_id = job_data.get('postedById') or '35eac158-cf81-4ec0-a523-a061b72eeb5f'
             site_id = job_data.get('siteId', '') or job_data.get('micrositeId', '')
@@ -199,6 +247,13 @@ class Database:
                     """)
                 except Exception as e:
                     logger.debug(f"requiredExperience column check: {str(e)}")
+                try:
+                    await conn.execute("""
+                        ALTER TABLE "JobPost"
+                        ADD COLUMN IF NOT EXISTS "categoryId" TEXT
+                    """)
+                except Exception as e:
+                    logger.debug(f"categoryId column check: {str(e)}")
                 
                 # Generate a unique ID for the job post
                 post_id = str(uuid.uuid4())
@@ -212,10 +267,10 @@ class Database:
                         "preferredExperience", "educationLevel", "certificationLevel", 
                         "interviewFormat", "postedById", channels, "siteId", 
                         "isScrapped", active, "createdAt", "updatedAt", "source_url", htmlContent,
-                        "requiredExperience"
+                        "requiredExperience", "categoryId"
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 
-                        $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
+                        $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28
                     )
                 """,
                     post_id,  # id
@@ -244,7 +299,8 @@ class Database:
                     now,  # updatedAt
                     source_url,  # source_url
                     html_content,  # html_content
-                    required_experience  # requiredExperience
+                    required_experience,  # requiredExperience
+                    category_id  # categoryId
                 )
                 
                 logger.info(f"Successfully inserted job post with ID: {post_id}")
@@ -253,4 +309,3 @@ class Database:
         except Exception as e:
             logger.error(f"Error inserting job post: {str(e)}")
             raise
-

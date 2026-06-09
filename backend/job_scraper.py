@@ -33,7 +33,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class JobScraper:
-    def __init__(self, filter_location: bool = False):
+    def __init__(
+        self,
+        filter_location: bool = False,
+        include_html_content: bool = True,
+        save_debug_html: Optional[bool] = None,
+        fast_mode: bool = False,
+        categories: Optional[List[Dict]] = None,
+    ):
         # Set OpenAI API key
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         if not self.openai_api_key:
@@ -42,9 +49,18 @@ class JobScraper:
         # OpenAI client for AI extraction
         self.openai_client = AsyncOpenAI(api_key=self.openai_api_key)
         
-        # Create debug directory if it doesn't exist
+        self.include_html_content = include_html_content
+        self.fast_mode = fast_mode
+        self.categories = categories or []
+        self.save_debug_html = (
+            save_debug_html
+            if save_debug_html is not None
+            else os.getenv("SAVE_DEBUG_HTML", "false").lower() == "true"
+        )
+
+        # Create debug directory only when debug snapshots are enabled.
         self.debug_dir = "debug_html"
-        if not os.path.exists(self.debug_dir):
+        if self.save_debug_html and not os.path.exists(self.debug_dir):
             os.makedirs(self.debug_dir)
         
         # Track scraped URLs to prevent duplicates
@@ -55,14 +71,86 @@ class JobScraper:
         self.filter_location = filter_location
 
     def _selenium_http_timeout_seconds(self) -> int:
-        """HTTP read timeout for chromedriver (large page_source needs more than default 120s)."""
-        return int(os.getenv("SELENIUM_HTTP_READ_TIMEOUT", "300"))
+        """HTTP read timeout for chromedriver commands."""
+        default_timeout = "60" if self.fast_mode else "120"
+        return int(os.getenv("SELENIUM_HTTP_READ_TIMEOUT", default_timeout))
 
     def _selenium_page_load_timeout_seconds(self) -> int:
         return int(os.getenv("SELENIUM_PAGE_LOAD_TIMEOUT", "45"))
 
     def _selenium_script_timeout_seconds(self) -> int:
         return int(os.getenv("SELENIUM_SCRIPT_TIMEOUT", "120"))
+
+    def _skip_main_document_scroll(self) -> bool:
+        """Skip slow parent-page scrolling in API fast mode unless explicitly enabled."""
+        value = os.getenv("SKIP_MAIN_DOCUMENT_SCROLL")
+        if value is not None:
+            return value.lower() in ("1", "true", "yes", "on")
+        return self.fast_mode
+
+    def _category_id(self, category: Dict) -> str:
+        for key in ("id", "categoryId", "category_id", "value", "uuid"):
+            value = category.get(key)
+            if value:
+                return str(value)
+        return ""
+
+    def _category_name(self, category: Dict) -> str:
+        for key in ("name", "title", "label", "category", "categoryName", "displayName", "slug"):
+            value = category.get(key)
+            if value:
+                return str(value)
+        return self._category_id(category)
+
+    def _format_categories_for_prompt(self) -> str:
+        if not self.categories:
+            return "No categories were provided. Return null for category_id and category_name."
+        lines = []
+        for category in self.categories:
+            category_id = self._category_id(category)
+            category_name = self._category_name(category)
+            if category_id or category_name:
+                lines.append(f"- id: {category_id}; name: {category_name}")
+        return "\n".join(lines) if lines else "No categories were provided. Return null for category_id and category_name."
+
+    def _normalize_extracted_category(self, job_data: Dict) -> None:
+        if not self.categories:
+            job_data["category_id"] = ""
+            job_data["category_name"] = ""
+            return
+
+        extracted_id = (job_data.get("category_id") or "").strip().lower()
+        extracted_name = (job_data.get("category_name") or job_data.get("category") or "").strip().lower()
+
+        for category in self.categories:
+            category_id = self._category_id(category)
+            category_name = self._category_name(category)
+            if (
+                extracted_id and extracted_id == category_id.lower()
+            ) or (
+                extracted_name and extracted_name == category_name.lower()
+            ):
+                job_data["category_id"] = category_id
+                job_data["category_name"] = category_name
+                return
+
+        # Conservative fallback: choose first category name mentioned in extracted job text.
+        haystack = " ".join(str(job_data.get(key, "")) for key in (
+            "job_title",
+            "job_description",
+            "key_responsibilities",
+            "qualifications_and_skills",
+            "required_experience",
+        )).lower()
+        for category in self.categories:
+            category_name = self._category_name(category)
+            if category_name and category_name.lower() in haystack:
+                job_data["category_id"] = self._category_id(category)
+                job_data["category_name"] = category_name
+                return
+
+        job_data["category_id"] = ""
+        job_data["category_name"] = ""
 
     def _apply_selenium_driver_timeouts(self, driver) -> None:
         """Apply timeouts so navigation/scripts don't hang forever; extend chromedriver HTTP timeout."""
@@ -331,6 +419,7 @@ class JobScraper:
         careers_seen: set,
         careers_job_hrefs: List[str],
         max_pages: int = 30,
+        max_job_links: Optional[int] = None,
     ) -> None:
         """Click through listing 'Next' pages (SilkRoad-style) and merge /Careers/jobs/{id} hrefs."""
         next_selectors = [
@@ -344,6 +433,8 @@ class JobScraper:
             "a#lnkPagerNext",
         ]
         for _ in range(max_pages):
+            if max_job_links is not None and len(careers_job_hrefs) >= max_job_links:
+                break
             clicked = False
             for sel in next_selectors:
                 try:
@@ -358,6 +449,8 @@ class JobScraper:
                                 if h not in careers_seen:
                                     careers_seen.add(h)
                                     careers_job_hrefs.append(h)
+                                    if max_job_links is not None and len(careers_job_hrefs) >= max_job_links:
+                                        break
                             break
                         except Exception:
                             continue
@@ -374,6 +467,7 @@ class JobScraper:
         wait_for_elements: Optional[List[str]] = None,
         delay: int = 2,
         iframe_scroll_rounds: int = 14,
+        max_job_links: Optional[int] = None,
     ) -> Tuple[List[Tuple[str, str]], List[str]]:
         """
         Load landing page once, return:
@@ -385,6 +479,37 @@ class JobScraper:
         chunks: List[Tuple[str, str]] = []
         careers_job_hrefs: List[str] = []
         careers_seen = set()
+
+        def enough_job_links() -> bool:
+            return max_job_links is not None and len(careers_job_hrefs) >= max_job_links
+
+        def collect_new_careers_links() -> int:
+            added = 0
+            for h in self._selenium_collect_careers_jobs_detail_hrefs(driver):
+                if h not in careers_seen:
+                    careers_seen.add(h)
+                    careers_job_hrefs.append(h)
+                    added += 1
+                    if enough_job_links():
+                        break
+            return added
+
+        def wait_for_scroll_update(height_script: str, previous_height: int, timeout: float, poll: float = 0.1) -> int:
+            """Poll briefly after scrolling; return as soon as links or height change."""
+            deadline = time.time() + timeout
+            current_height = previous_height
+            while time.time() < deadline:
+                if collect_new_careers_links() > 0 or enough_job_links():
+                    break
+                try:
+                    current_height = driver.execute_script(height_script)
+                    if current_height != previous_height:
+                        break
+                except Exception:
+                    break
+                time.sleep(poll)
+            return current_height
+
         try:
             print(f"Loading listing page + iframes (single session): {url}")
             driver = self._setup_selenium_driver()
@@ -395,39 +520,44 @@ class JobScraper:
 
             if wait_for_elements:
                 combined_selector = ", ".join(wait_for_elements)
+                selector_wait_timeout = 4 if self.fast_mode else 8
                 try:
-                    WebDriverWait(driver, 8).until(
+                    WebDriverWait(driver, selector_wait_timeout).until(
                         EC.presence_of_element_located((By.CSS_SELECTOR, combined_selector))
                     )
                     print(f"✅ Found page-ready element(s): {combined_selector}")
                 except TimeoutException:
                     print("⚠️ Quick wait timeout for job selectors, continue with current DOM")
 
-            print("Scrolling progressively to load JS/lazy job cards (main document)...")
-            previous_height = driver.execute_script("return document.body.scrollHeight")
-            stable_rounds = 0
-            max_rounds = 6
-            for round_index in range(max_rounds):
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(1.0)
-                for h in self._selenium_collect_careers_jobs_detail_hrefs(driver):
-                    if h not in careers_seen:
-                        careers_seen.add(h)
-                        careers_job_hrefs.append(h)
-                current_height = driver.execute_script("return document.body.scrollHeight")
-                if current_height == previous_height:
-                    stable_rounds += 1
-                else:
-                    stable_rounds = 0
-                previous_height = current_height
-                if stable_rounds >= 2:
-                    break
-            driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(0.5)
-            for h in self._selenium_collect_careers_jobs_detail_hrefs(driver):
-                if h not in careers_seen:
-                    careers_seen.add(h)
-                    careers_job_hrefs.append(h)
+            collect_new_careers_links()
+            if self._skip_main_document_scroll():
+                print("⏭️ Skipping main-document progressive scroll in fast mode")
+            else:
+                print("Scrolling progressively to load JS/lazy job cards (main document)...")
+                main_height_script = "return document.body.scrollHeight"
+                previous_height = driver.execute_script(main_height_script)
+                stable_rounds = 0
+                max_rounds = 4 if self.fast_mode else 6
+                main_scroll_timeout = 0.8 if self.fast_mode else 1.2
+                for round_index in range(max_rounds):
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    current_height = wait_for_scroll_update(
+                        main_height_script,
+                        previous_height,
+                        main_scroll_timeout,
+                    )
+                    if enough_job_links():
+                        break
+                    if current_height == previous_height:
+                        stable_rounds += 1
+                    else:
+                        stable_rounds = 0
+                    previous_height = current_height
+                    if stable_rounds >= 2:
+                        break
+                driver.execute_script("window.scrollTo(0, 0);")
+                time.sleep(0.1 if self.fast_mode else 0.5)
+            collect_new_careers_links()
 
             # SilkRoad embed: iframe starts as loading.html; snippet swaps src async — often still
             # loading when we snapshot. Resolve real listing URL from cxembeddedroot / data-* and set src.
@@ -435,13 +565,16 @@ class JobScraper:
             resolved_listing = self._resolve_silkroad_careers_listing_url(url, driver)
             if resolved_listing:
                 print(f"📎 Resolved SilkRoad listing URL: {resolved_listing[:140]}...")
-                if not self._wait_silkroad_iframe_navigated_from_loading(driver, timeout=25.0):
+                first_iframe_wait = 8.0 if self.fast_mode else 25.0
+                second_iframe_wait = 20.0 if self.fast_mode else 90.0
+                iframe_settle_sleep = 1.5 if self.fast_mode else 4.0
+                if not self._wait_silkroad_iframe_navigated_from_loading(driver, timeout=first_iframe_wait):
                     self._force_silkroad_iframe_src(driver, resolved_listing)
-                    time.sleep(2)
-                self._wait_silkroad_iframe_navigated_from_loading(driver, timeout=90.0)
-                time.sleep(4)
+                    time.sleep(0.5 if self.fast_mode else 2)
+                self._wait_silkroad_iframe_navigated_from_loading(driver, timeout=second_iframe_wait)
+                time.sleep(iframe_settle_sleep)
             else:
-                self._wait_silkroad_iframe_navigated_from_loading(driver, timeout=60.0)
+                self._wait_silkroad_iframe_navigated_from_loading(driver, timeout=5.0 if self.fast_mode else 60.0)
 
             main_html = driver.page_source
             chunks.append((url, main_html))
@@ -474,6 +607,8 @@ class JobScraper:
                   f"processing {len(top_iframes)} (prioritize SilkRoad, skip trackers)")
 
             for idx in range(len(top_iframes)):
+                if enough_job_links():
+                    break
                 driver.switch_to.default_content()
                 iframes_now = _ordered_iframes_for_jobs(driver)
                 if idx >= len(iframes_now):
@@ -484,7 +619,7 @@ class JobScraper:
                 # If still on loading.html, force real listing URL once more
                 if resolved_listing and "loading.html" in src.lower():
                     self._force_silkroad_iframe_src(driver, resolved_listing)
-                    time.sleep(4)
+                    time.sleep(1.5 if self.fast_mode else 4)
                     driver.switch_to.default_content()
                     el = driver.find_elements(By.ID, "silkroadJobs_cx_container")
                     el = el[0] if el else iframes_now[idx]
@@ -492,9 +627,9 @@ class JobScraper:
                     iframe_base = urljoin(url, src) if src else url
                 try:
                     driver.switch_to.frame(el)
-                    time.sleep(max(2, delay))
+                    time.sleep(max(1.0, delay) if self.fast_mode else max(2, delay))
                     try:
-                        WebDriverWait(driver, 15).until(
+                        WebDriverWait(driver, 6 if self.fast_mode else 15).until(
                             EC.presence_of_element_located((By.CSS_SELECTOR, iframe_wait_selector))
                         )
                         print(f"✅ Iframe {idx} ready ({iframe_base[:80]}...)")
@@ -503,22 +638,24 @@ class JobScraper:
 
                     # Scroll iframe and collect /Careers/jobs/{id} hrefs each step (virtualized lists)
                     stable = 0
-                    prev = driver.execute_script(
+                    iframe_height_script = (
                         "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);"
                     )
-                    for r in range(iframe_scroll_rounds):
+                    prev = driver.execute_script(iframe_height_script)
+                    iframe_rounds = min(iframe_scroll_rounds, 6) if self.fast_mode else iframe_scroll_rounds
+                    iframe_scroll_timeout = 0.6 if self.fast_mode else 0.8
+                    for r in range(iframe_rounds):
                         driver.execute_script(
                             "window.scrollTo(0, Math.max(document.body.scrollHeight, "
                             "document.documentElement.scrollHeight));"
                         )
-                        time.sleep(0.65)
-                        for h in self._selenium_collect_careers_jobs_detail_hrefs(driver):
-                            if h not in careers_seen:
-                                careers_seen.add(h)
-                                careers_job_hrefs.append(h)
-                        cur = driver.execute_script(
-                            "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);"
+                        cur = wait_for_scroll_update(
+                            iframe_height_script,
+                            prev,
+                            iframe_scroll_timeout,
                         )
+                        if enough_job_links():
+                            break
                         if cur == prev:
                             stable += 1
                             if stable >= 2 and r > 1:
@@ -526,15 +663,12 @@ class JobScraper:
                         else:
                             stable = 0
                         prev = cur
-                    for h in self._selenium_collect_careers_jobs_detail_hrefs(driver):
-                        if h not in careers_seen:
-                            careers_seen.add(h)
-                            careers_job_hrefs.append(h)
+                    collect_new_careers_links()
 
-                    if "silkroad" in iframe_base.lower():
+                    if "silkroad" in iframe_base.lower() and not enough_job_links():
                         print(f"📄 SilkRoad iframe: paginating to collect all /Careers/jobs/{{id}} links...")
                         self._selenium_paginate_and_collect_careers_jobs(
-                            driver, careers_seen, careers_job_hrefs
+                            driver, careers_seen, careers_job_hrefs, max_job_links=max_job_links
                         )
 
                     inner_html = driver.page_source
@@ -544,6 +678,8 @@ class JobScraper:
                     # One level of nested iframes (some ATS embed twice)
                     nested = driver.find_elements(By.TAG_NAME, "iframe")
                     for j in range(len(nested)):
+                        if enough_job_links():
+                            break
                         try:
                             in_list = driver.find_elements(By.TAG_NAME, "iframe")
                             if j >= len(in_list):
@@ -552,30 +688,32 @@ class JobScraper:
                             nsrc = (nel.get_attribute("src") or "").strip()
                             nbase = urljoin(iframe_base, nsrc) if nsrc else iframe_base
                             driver.switch_to.frame(nel)
-                            time.sleep(2)
+                            time.sleep(0.75 if self.fast_mode else 2)
                             try:
-                                WebDriverWait(driver, 12).until(
+                                WebDriverWait(driver, 4 if self.fast_mode else 12).until(
                                     EC.presence_of_element_located((By.CSS_SELECTOR, iframe_wait_selector))
                                 )
                             except TimeoutException:
                                 pass
                             stable_n = 0
-                            prev_n = driver.execute_script(
+                            nested_height_script = (
                                 "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);"
                             )
-                            for r in range(8):
+                            prev_n = driver.execute_script(nested_height_script)
+                            nested_rounds = 4 if self.fast_mode else 8
+                            nested_timeout = 0.5 if self.fast_mode else 0.75
+                            for r in range(nested_rounds):
                                 driver.execute_script(
                                     "window.scrollTo(0, Math.max(document.body.scrollHeight, "
                                     "document.documentElement.scrollHeight));"
                                 )
-                                time.sleep(0.6)
-                                for h in self._selenium_collect_careers_jobs_detail_hrefs(driver):
-                                    if h not in careers_seen:
-                                        careers_seen.add(h)
-                                        careers_job_hrefs.append(h)
-                                cur_n = driver.execute_script(
-                                    "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);"
+                                cur_n = wait_for_scroll_update(
+                                    nested_height_script,
+                                    prev_n,
+                                    nested_timeout,
                                 )
+                                if enough_job_links():
+                                    break
                                 if cur_n == prev_n:
                                     stable_n += 1
                                     if stable_n >= 2 and r > 1:
@@ -583,15 +721,12 @@ class JobScraper:
                                 else:
                                     stable_n = 0
                                 prev_n = cur_n
-                            for h in self._selenium_collect_careers_jobs_detail_hrefs(driver):
-                                if h not in careers_seen:
-                                    careers_seen.add(h)
-                                    careers_job_hrefs.append(h)
+                            collect_new_careers_links()
 
-                            if "silkroad" in nbase.lower():
+                            if "silkroad" in nbase.lower() and not enough_job_links():
                                 print(f"📄 Nested SilkRoad iframe: paginating...")
                                 self._selenium_paginate_and_collect_careers_jobs(
-                                    driver, careers_seen, careers_job_hrefs
+                                    driver, careers_seen, careers_job_hrefs, max_job_links=max_job_links
                                 )
 
                             chunks.append((nbase, driver.page_source))
@@ -786,6 +921,9 @@ class JobScraper:
     
     def _save_html_debug(self, html_content: str, url: str, page_type: str = "page"):
         """Save HTML content to a debug file for inspection"""
+        if not self.save_debug_html:
+            return None
+
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             # Clean URL for filename
@@ -802,11 +940,22 @@ class JobScraper:
             print(f"❌ Failed to save HTML debug file: {str(e)}")
             return None
         
-    async def scrape_jobs(self, url: str, max_jobs: Optional[int] = None) -> List[Dict]:
+    async def scrape_jobs(
+        self,
+        url: str,
+        max_jobs: Optional[int] = None,
+        existing_source_urls: Optional[set] = None,
+    ) -> List[Dict]:
         """Main function to scrape all jobs from a given URL with pagination support.
         If max_jobs is set, scraping stops after that many jobs have been successfully scraped."""
         # Reset scraping state for new session
         self.reset_scraping_state()
+        existing_source_urls = existing_source_urls or set()
+        existing_normalized_urls = {
+            self._normalize_url_remove_query(existing_url)
+            for existing_url in existing_source_urls
+            if existing_url
+        }
         
         try:
             # Get the initial page HTML using Selenium
@@ -827,8 +976,16 @@ class JobScraper:
                 "a[href*='/job/']",
             ]
             
-            # Single Selenium session: main + iframe HTML + live /Careers/jobs/{id} href collection
-            html_chunks, dom_careers_job_urls = self._get_listing_html_chunks(url, wait_for_elements, delay=2)
+            # Single Selenium session: main + iframe HTML + live /Careers/jobs/{id} href collection.
+            # For small API requests, collect a small buffer instead of exhausting large listings.
+            max_job_links = None if max_jobs is None else max(max_jobs * 6, max_jobs + 12)
+            html_chunks, dom_careers_job_urls = self._get_listing_html_chunks(
+                url,
+                wait_for_elements,
+                delay=1.5 if self.fast_mode else 2,
+                iframe_scroll_rounds=6 if self.fast_mode else 14,
+                max_job_links=max_job_links,
+            )
             if not html_chunks:
                 raise Exception(f"Failed to get HTML from URL: {url}")
 
@@ -842,7 +999,13 @@ class JobScraper:
             job_links.extend(dom_careers_job_urls)
             print(f"✅ DOM-collected SilkRoad-style /Careers/jobs/{{id}} URLs: {len(dom_careers_job_urls)}")
             for chunk_base, chunk_html in html_chunks:
-                chunk_links = await self._extract_job_links(chunk_html, chunk_base)
+                if max_job_links is not None and len(set(job_links)) >= max_job_links:
+                    break
+                chunk_links = await self._extract_job_links(
+                    chunk_html,
+                    chunk_base,
+                    max_links=max_job_links,
+                )
                 job_links.extend(chunk_links)
                 print(f"✅ Extracted {len(chunk_links)} links from chunk base {chunk_base[:90]}...")
             print(f"✅ Total raw job links (DOM + all HTML chunks): {len(job_links)}")
@@ -870,7 +1033,7 @@ class JobScraper:
             # Scrape individual job details using Crawl4AI for AI extraction
 
             all_jobs = []
-            async with AsyncWebCrawler(verbose=True) as crawler:
+            async with AsyncWebCrawler(verbose=False) as crawler:
                 for i, job_url in enumerate(unique_job_links, 1):
                     # Stop when we have enough jobs
                     if max_jobs is not None and len(all_jobs) >= max_jobs:
@@ -881,9 +1044,18 @@ class JobScraper:
                         if self._is_url_scraped(job_url):
                             print(f"⏭️ Skipping already scraped job {i}/{len(unique_job_links)}: {job_url}")
                             continue
+
+                        normalized_job_url = self._normalize_url_remove_query(job_url)
+                        if normalized_job_url in existing_normalized_urls:
+                            print(f"⏭️ Skipping existing DB job {i}/{len(unique_job_links)}: {job_url}")
+                            self._mark_url_scraped(job_url)
+                            continue
                         
                         print(f"🔄 Scraping job {i}/{len(unique_job_links)}: {job_url}")
-                        job_data = await self._scrape_individual_job_with_crawl4ai(job_url)
+                        job_data = await self._scrape_individual_job_with_crawl4ai(
+                            job_url,
+                            crawler=crawler,
+                        )
                         
                         if job_data:
                             # If job_title is missing, this likely isn't a detailed job page
@@ -919,17 +1091,26 @@ class JobScraper:
             print(f"❌ Error in scrape_jobs: {str(e)}")
             return []
     
-    async def _extract_job_links(self, html: str, base_url: str) -> List[str]:
+    async def _extract_job_links(
+        self,
+        html: str,
+        base_url: str,
+        max_links: Optional[int] = None,
+    ) -> List[str]:
         """Extract job links from the HTML content, ignoring headers and footers"""
         soup = BeautifulSoup(html, 'html.parser')
         job_links = []
+
+        def has_enough_links() -> bool:
+            return max_links is not None and len(set(job_links)) >= max_links
         
         # Only remove head and footer elements - keep everything else
         elements_to_remove = [
             'head', 'footer'
         ]
         
-        print(f"Removing only <head> and <footer> elements...")
+        if not self.fast_mode:
+            print(f"Removing only <head> and <footer> elements...")
         removed_count = 0
         for selector in elements_to_remove:
             try:
@@ -940,11 +1121,13 @@ class JobScraper:
             except Exception as e:
                 continue
         
-        print(f"Removed {removed_count} <head>/<footer> elements")
+        if not self.fast_mode:
+            print(f"Removed {removed_count} <head>/<footer> elements")
         
         # Use the entire remaining document (no main content filtering)
         main_content = soup
-        print("Using entire document after <head>/<footer> removal")
+        if not self.fast_mode:
+            print("Using entire document after <head>/<footer> removal")
         
         # Enhanced selectors for job links - prioritizing the exact patterns from the HTML
         job_link_selectors = [
@@ -987,29 +1170,36 @@ class JobScraper:
             'a[title*="job" i]'
         ]
         
-        print(f"Extracting job links from cleaned document...")
+        if not self.fast_mode:
+            print(f"Extracting job links from cleaned document...")
         
         # DEBUG: Show a sample of the remaining HTML to verify structure
-        remaining_html_sample = str(main_content)[:2000]
-        print(f"Sample of remaining HTML after cleaning: {remaining_html_sample[:500]}...")
-        
-        # DEBUG: Check for specific patterns in the HTML
-        if 'jobCardTitle' in remaining_html_sample:
-            print("✅ Found 'jobCardTitle' in HTML")
-        if 'JobsList_jobCardTitle__pRNjw' in remaining_html_sample:
-            print("✅ Found 'JobsList_jobCardTitle__pRNjw' class in HTML")
-        if 'data-testid="jobCardTitle_' in remaining_html_sample:
-            print("✅ Found 'data-testid=\"jobCardTitle_\"' in HTML")
-        if '/job/' in remaining_html_sample:
-            print("✅ Found '/job/' href pattern in HTML")
+        if not self.fast_mode:
+            remaining_html_sample = str(main_content)[:2000]
+            print(f"Sample of remaining HTML after cleaning: {remaining_html_sample[:500]}...")
+            
+            # DEBUG: Check for specific patterns in the HTML
+            if 'jobCardTitle' in remaining_html_sample:
+                print("✅ Found 'jobCardTitle' in HTML")
+            if 'JobsList_jobCardTitle__pRNjw' in remaining_html_sample:
+                print("✅ Found 'JobsList_jobCardTitle__pRNjw' class in HTML")
+            if 'data-testid="jobCardTitle_' in remaining_html_sample:
+                print("✅ Found 'data-testid=\"jobCardTitle_\"' in HTML")
+            if '/job/' in remaining_html_sample:
+                print("✅ Found '/job/' href pattern in HTML")
         
         for selector in job_link_selectors:
+            if has_enough_links():
+                break
             try:
                 # Search within the cleaned document
                 links = main_content.select(selector)
-                print(f"Selector '{selector}' found {len(links)} links")
+                if not self.fast_mode:
+                    print(f"Selector '{selector}' found {len(links)} links")
                 
                 for link in links:
+                    if has_enough_links():
+                        break
                     # Check if this link is inside an element with "header" or "footer" in id/class
                     # (even though we removed such elements, check parent chain to be safe)
                     is_in_header_footer = False
@@ -1036,7 +1226,8 @@ class JobScraper:
                         parent = getattr(parent, 'parent', None)
                     
                     if is_in_header_footer:
-                        print(f"Skipping link inside header/footer: {link.get('href', '')}")
+                        if not self.fast_mode:
+                            print(f"Skipping link inside header/footer: {link.get('href', '')}")
                         continue
                     
                     href = link.get('href')
@@ -1045,18 +1236,24 @@ class JobScraper:
                         # Simplified validation - just check if it's a job URL
                         if self._is_job_url(full_url):
                             job_links.append(full_url)
-                            print(f"Added job link: {full_url}")
+                            if not self.fast_mode:
+                                print(f"Added job link: {full_url}")
             except Exception as e:
-                print(f"Error with selector '{selector}': {str(e)}")
+                if not self.fast_mode:
+                    print(f"Error with selector '{selector}': {str(e)}")
                 continue
 
         # Regex pass: picks up URLs in script/JSON or non-standard attributes (common in SPAs / SilkRoad)
-        for ru in self._extract_detail_job_urls_regex(html, base_url):
-            if re.search(r"/(?:[Cc]areers/)?jobs/\d+", ru) or re.search(r"OpportunityDetail.*opportunityId=", ru, re.IGNORECASE):
-                job_links.append(ru)
-                print(f"Added job link (regex): {ru}")
+        if not has_enough_links():
+            for ru in self._extract_detail_job_urls_regex(html, base_url):
+                if re.search(r"/(?:[Cc]areers/)?jobs/\d+", ru) or re.search(r"OpportunityDetail.*opportunityId=", ru, re.IGNORECASE):
+                    job_links.append(ru)
+                    if not self.fast_mode:
+                        print(f"Added job link (regex): {ru}")
+                    if has_enough_links():
+                        break
         
-        unique_links = list(set(job_links))  # Remove duplicates
+        unique_links = list(dict.fromkeys(job_links))  # Remove duplicates while preserving listing order
         print(f"Total unique job links found: {len(unique_links)}")
         return unique_links
 
@@ -1377,11 +1574,7 @@ class JobScraper:
             html_content = re.sub(r"\u00c2(?=\s|<|&)", "", html_content)
 
             soup = BeautifulSoup(html_content, "html.parser")
-            # Remove branding container(s), e.g. SilkRoad / ATS "asbranding"
-            for el in soup.find_all(True):
-                eid = (el.get("id") or "").strip()
-                if eid.lower() == "asbranding":
-                    el.decompose()
+            self._remove_apply_refer_and_branding_tail(soup)
             # Replace background-color #2f5496 or its computed rgb(47, 84, 150)
             new_bg = "background-color: rgb(69 103 112 / var(--tw-bg-opacity, 1))"
             bg_color_pat = re.compile(
@@ -1407,6 +1600,65 @@ class JobScraper:
         except Exception as e:
             logger.warning(f"html_content post-process skipped: {e}")
             return html_content
+
+    def _remove_apply_refer_and_branding_tail(self, soup: BeautifulSoup) -> None:
+        """
+        Remove action/ATS blocks from the first real Apply/Refer/branding control onward.
+        This targets buttons/links, not ordinary paragraphs that merely mention applying.
+        """
+        action_text_re = re.compile(r"^\s*(apply(?:\s+now)?|refer\s+to\s+a\s+friend)\s*$", re.I)
+        attr_re = re.compile(r"(apply|refer|asbranding|branding|jobalert|job-alert)", re.I)
+
+        for branding in list(soup.find_all(id=lambda value: value and str(value).strip().lower() == "asbranding")):
+            branding.decompose()
+
+        def attrs_text(el) -> str:
+            parts = [el.get("id", "")]
+            classes = el.get("class", [])
+            if isinstance(classes, list):
+                parts.extend(str(c) for c in classes)
+            else:
+                parts.append(str(classes))
+            for attr in ("href", "aria-label", "title", "data-testid", "data-automation", "role"):
+                parts.append(str(el.get(attr, "")))
+            return " ".join(parts)
+
+        def is_cutoff(el) -> bool:
+            if not getattr(el, "name", None):
+                return False
+            text = el.get_text(" ", strip=True)
+            attrs = attrs_text(el)
+            if (el.name in ("a", "button") or el.get("role") == "button") and (
+                action_text_re.match(text or "") or attr_re.search(attrs)
+            ):
+                return True
+            if el.name in ("input",) and attr_re.search(attrs + " " + str(el.get("value", ""))):
+                return True
+            return False
+
+        cutoff = None
+        for el in soup.find_all(True):
+            if (el.get("id") or "").strip().lower() == "asbranding":
+                cutoff = el
+                break
+            if is_cutoff(el):
+                cutoff = el
+                break
+
+        if not cutoff:
+            return
+
+        block = cutoff
+        for parent in cutoff.parents:
+            if not getattr(parent, "name", None) or parent.name in ("[document]", "body", "main"):
+                break
+            if parent.name in ("div", "section", "aside", "form", "p", "li"):
+                block = parent
+                break
+
+        for sibling in list(block.find_next_siblings()):
+            sibling.decompose()
+        block.decompose()
 
     async def _extract_html_content_with_styles(self, html: str, base_url: str) -> Optional[str]:
         """
@@ -1615,14 +1867,13 @@ class JobScraper:
                                className.includes('header') || className.includes('footer');
                     }
                     
-                    // Remove elements with "search" or "apply-button" in id or classname
+                    // Remove search controls; action buttons are handled by post-process cutoff.
                     function shouldRemoveElement(element) {
                         const id = element.getAttribute('id') || '';
                         const className = element.getAttribute('class') || '';
                         const idLower = id.toLowerCase();
                         const classLower = className.toLowerCase();
-                        return idLower.includes('search') || idLower.includes('apply-button') ||
-                               classLower.includes('search') || classLower.includes('apply-button');
+                        return idLower.includes('search') || classLower.includes('search');
                     }
                     
                     // Remove matching elements
@@ -1733,7 +1984,7 @@ class JobScraper:
             for element in elements_to_remove:
                 element.decompose()
             
-            # Remove elements with "search" or "apply-button" in id or classname
+            # Remove search controls; action buttons are handled by post-process cutoff.
             for element in soup.find_all(True):
                 element_id = element.get('id', '') or ''
                 element_class = element.get('class', [])
@@ -1745,8 +1996,7 @@ class JobScraper:
                 id_lower = element_id.lower()
                 class_lower = element_class.lower()
                 
-                if 'search' in id_lower or 'search' in class_lower or \
-                   'apply-button' in id_lower or 'apply-button' in class_lower:
+                if 'search' in id_lower or 'search' in class_lower:
                     element.decompose()
             
             # Try to find the main content area
@@ -2021,19 +2271,34 @@ class JobScraper:
             logger.warning(f"Error matching selector '{selector}': {str(e)}")
             return False
     
-    async def _scrape_individual_job_with_crawl4ai(self, job_url: str) -> Optional[Dict]:
+    async def _scrape_individual_job_with_crawl4ai(
+        self,
+        job_url: str,
+        crawler: Optional[AsyncWebCrawler] = None,
+    ) -> Optional[Dict]:
         """Scrape individual job details using Crawl4AI and OpenAI for extraction"""
         try:
             logger.info(f"Scraping job with Crawl4AI: {job_url}")
             
-            # Use Crawl4AI to get the HTML with delay
-            async with AsyncWebCrawler(verbose=True) as crawler:
+            # Use the shared crawler from scrape_jobs when available. Creating a fresh
+            # crawler/browser per job is one of the biggest latency costs.
+            detail_delay = 2
+            detail_page_timeout = 45000 if self.fast_mode else 60000
+            if crawler is not None:
                 result = await crawler.arun(
                     url=job_url,
-                    delay_before_return_html=2,  # 2 second delay
+                    delay_before_return_html=detail_delay,
                     timeout=30000,
-                    page_timeout=60000
+                    page_timeout=detail_page_timeout
                 )
+            else:
+                async with AsyncWebCrawler(verbose=False) as local_crawler:
+                    result = await local_crawler.arun(
+                        url=job_url,
+                        delay_before_return_html=detail_delay,
+                        timeout=30000,
+                        page_timeout=detail_page_timeout
+                    )
             
             if not result.success:
                 logger.error(f"Failed to crawl job page: {job_url}")
@@ -2043,15 +2308,19 @@ class JobScraper:
             if hasattr(result, 'html') and result.html:
                 self._save_html_debug(result.html, job_url, "individual_job")
             
-            # Extract HTML content with inlined styles
-            html_content = await self._extract_html_content_with_styles(result.html, job_url)
-            
             # Use OpenAI to extract structured data from the HTML
             job_data = await self._extract_job_data_with_ai(result.html, job_url)
             
-            # Add HTML content to job data
-            if html_content:
-                job_data["html_content"] = html_content
+            if self.include_html_content:
+                # API fast mode already has rendered HTML from Crawl4AI. Avoid a
+                # second Selenium navigation per job; inline styles from available
+                # HTML/CSS instead. Deep/non-fast mode keeps computed-style Selenium.
+                if self.fast_mode:
+                    html_content = await self._extract_html_content_with_styles_fallback(result.html, job_url)
+                else:
+                    html_content = await self._extract_html_content_with_styles(result.html, job_url)
+                if html_content:
+                    job_data["html_content"] = html_content
             
             return job_data
                 
@@ -2069,11 +2338,14 @@ class JobScraper:
         for script in soup(["script", "style"]):
             script.decompose()
         
-        # Get text content and limit length
-        text_content = soup.get_text()
-        # Limit to ~4000 characters to stay within token limits
-        if len(text_content) > 4000:
-            text_content = text_content[:4000] + "..."
+        # Get text content and limit length. A 4k character cutoff often misses
+        # qualifications/benefits on longer ATS pages, so keep a larger window.
+        text_content = soup.get_text(separator="\n", strip=True)
+        max_ai_chars = int(os.getenv("AI_EXTRACTION_MAX_CHARS", "8000"))
+        if len(text_content) > max_ai_chars:
+            text_content = text_content[:max_ai_chars] + "..."
+
+        category_options = self._format_categories_for_prompt()
         
         prompt = f"""
         Extract job information from the following job posting content. Return the data as a JSON object with these exact fields:
@@ -2094,23 +2366,29 @@ class JobScraper:
         - educational_level: Education requirements
         - certification_level: Required certifications
         - interview_format: Interview process information
+        - category_id: The id of exactly one category selected from the category list below
+        - category_name: The name of exactly one category selected from the category list below
 
         Job URL: {job_url}
+
+        Category list:
+        {category_options}
         
         Job Content:
         {text_content}
         
         Return only valid JSON. If a field is not found, use null as the value.
+        For category_id and category_name, choose the single best matching category from the Category list. Do not invent a category.
         """
         
         try:
             response = await self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
                 messages=[
                     {"role": "system", "content": "You are a job data extraction assistant. Extract job information and return it as valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=1000,
+                max_tokens=1800,
                 temperature=0.1
             )
             
@@ -2139,6 +2417,8 @@ class JobScraper:
                         cleaned_data[key] = ""
                     else:
                         cleaned_data[key] = str(value)
+
+                self._normalize_extracted_category(cleaned_data)
                 
                 cleaned_data["source_url"] = job_url  # Add the job URL
                 return cleaned_data
@@ -2162,6 +2442,8 @@ class JobScraper:
                     "educational_level": "",
                     "certification_level": "",
                     "interview_format": "",
+                    "category_id": "",
+                    "category_name": "",
                     "source_url": job_url
                 }
                 
@@ -2185,5 +2467,7 @@ class JobScraper:
                 "educational_level": "",
                 "certification_level": "",
                 "interview_format": "",
+                "category_id": "",
+                "category_name": "",
                 "source_url": job_url
             }
