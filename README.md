@@ -147,6 +147,7 @@ Scrapes jobs from a given URL.
 - `REACT_APP_API_URL`: Backend API URL (defaults to `http://localhost:8000`)
 - `SELENIUM_HTTP_READ_TIMEOUT`: Chromedriver command timeout. Fast API mode defaults to `60`; deep mode defaults to `120`.
 - `SKIP_MAIN_DOCUMENT_SCROLL`: Set to `true` to skip slow parent-page scrolling. API fast mode does this by default while still processing iframes/listings.
+- `SCROLL_DETAIL_BEFORE_HTML`: Set to `true` only when a job detail page lazy-loads content after scrolling; defaults to `false` for faster accurate styled HTML extraction.
 
 ### Customization
 

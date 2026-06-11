@@ -862,6 +862,32 @@ class JobScraper:
         """Mark a URL as scraped"""
         normalized = self._normalize_url_remove_query(url)
         self.scraped_urls.add(normalized)
+
+    def _normalize_existing_source_urls(self, existing_source_urls: set) -> set:
+        """Normalize DB source URLs for duplicate checks before detail scraping."""
+        return {
+            self._normalize_url_remove_query(existing_url)
+            for existing_url in existing_source_urls
+            if existing_url
+        }
+
+    async def _load_existing_source_urls_from_db(self) -> set:
+        """Load existing JobPost sourceUrl values when caller did not provide them."""
+        db = None
+        try:
+            from database import Database
+
+            db = Database()
+            await db.connect()
+            source_urls = await db.get_scraped_source_urls()
+            print(f"🔎 Loaded {len(source_urls)} existing JobPost source URLs from DB")
+            return source_urls
+        except Exception as e:
+            print(f"⚠️ Could not load existing JobPost source URLs from DB; duplicate DB skip disabled: {e}")
+            return set()
+        finally:
+            if db:
+                await db.close()
     
     def _add_scraped_job(self, job_data: Dict):
         """Add a successfully scraped job to the list"""
@@ -950,12 +976,9 @@ class JobScraper:
         If max_jobs is set, scraping stops after that many jobs have been successfully scraped."""
         # Reset scraping state for new session
         self.reset_scraping_state()
-        existing_source_urls = existing_source_urls or set()
-        existing_normalized_urls = {
-            self._normalize_url_remove_query(existing_url)
-            for existing_url in existing_source_urls
-            if existing_url
-        }
+        if existing_source_urls is None:
+            existing_source_urls = await self._load_existing_source_urls_from_db()
+        existing_normalized_urls = self._normalize_existing_source_urls(existing_source_urls)
         
         try:
             # Get the initial page HTML using Selenium
@@ -1047,7 +1070,7 @@ class JobScraper:
 
                         normalized_job_url = self._normalize_url_remove_query(job_url)
                         if normalized_job_url in existing_normalized_urls:
-                            print(f"⏭️ Skipping existing DB job {i}/{len(unique_job_links)}: {job_url}")
+                            print(f"⏭️ Skipping existing JobPost sourceUrl {i}/{len(unique_job_links)}: {job_url}")
                             self._mark_url_scraped(job_url)
                             continue
                         
@@ -1575,6 +1598,10 @@ class JobScraper:
 
             soup = BeautifulSoup(html_content, "html.parser")
             self._remove_apply_refer_and_branding_tail(soup)
+            for paragraph in list(soup.find_all("p")):
+                text = paragraph.get_text("", strip=True).replace("\u00a0", "").strip()
+                if not text and not paragraph.find(["img", "video", "iframe", "object", "embed", "br"]):
+                    paragraph.decompose()
             # Replace background-color #2f5496 or its computed rgb(47, 84, 150)
             new_bg = "background-color: rgb(69 103 112 / var(--tw-bg-opacity, 1))"
             bg_color_pat = re.compile(
@@ -1603,44 +1630,53 @@ class JobScraper:
 
     def _remove_apply_refer_and_branding_tail(self, soup: BeautifulSoup) -> None:
         """
-        Remove action/ATS blocks from the first real Apply/Refer/branding control onward.
-        This targets buttons/links, not ordinary paragraphs that merely mention applying.
+        Remove exact Apply Now / Refer to a Friend controls and following action area.
+        This targets visible button/link text, not broad attributes or ordinary text.
         """
-        action_text_re = re.compile(r"^\s*(apply(?:\s+now)?|refer\s+to\s+a\s+friend)\s*$", re.I)
-        attr_re = re.compile(r"(apply|refer|asbranding|branding|jobalert|job-alert)", re.I)
+        action_text_re = re.compile(r"^\s*(apply\s+now|refer\s+to\s+a\s+friend)\s*$", re.I)
 
-        for branding in list(soup.find_all(id=lambda value: value and str(value).strip().lower() == "asbranding")):
+        for branding in list(soup.find_all(id=lambda value: value and str(value).strip().lower() in ("asbranding", "asbreadcrumbs"))):
             branding.decompose()
-
-        def attrs_text(el) -> str:
-            parts = [el.get("id", "")]
-            classes = el.get("class", [])
-            if isinstance(classes, list):
-                parts.extend(str(c) for c in classes)
-            else:
-                parts.append(str(classes))
-            for attr in ("href", "aria-label", "title", "data-testid", "data-automation", "role"):
-                parts.append(str(el.get(attr, "")))
-            return " ".join(parts)
 
         def is_cutoff(el) -> bool:
             if not getattr(el, "name", None):
                 return False
             text = el.get_text(" ", strip=True)
-            attrs = attrs_text(el)
-            if (el.name in ("a", "button") or el.get("role") == "button") and (
-                action_text_re.match(text or "") or attr_re.search(attrs)
-            ):
+            if (el.name in ("a", "button") or el.get("role") == "button") and action_text_re.match(text or ""):
                 return True
-            if el.name in ("input",) and attr_re.search(attrs + " " + str(el.get("value", ""))):
+            if el.name == "input" and action_text_re.match(str(el.get("value", ""))):
                 return True
             return False
 
+        def text_len(el) -> int:
+            return len(el.get_text(" ", strip=True)) if getattr(el, "get_text", None) else 0
+
+        def select_action_block(el):
+            block = el
+            for parent in el.parents:
+                if not getattr(parent, "name", None) or parent.name in ("[document]", "body", "main"):
+                    break
+                if parent.name not in ("div", "section", "aside", "form", "p", "li"):
+                    continue
+                parent_text = parent.get_text(" ", strip=True)
+                action_only = re.fullmatch(
+                    r"(?is)\s*(apply\s+now|refer\s+to\s+a\s+friend)(\s+(apply\s+now|refer\s+to\s+a\s+friend))*\s*",
+                    parent_text or "",
+                )
+                has_content_children = bool(parent.find(
+                    ["h1", "h2", "h3", "h4", "p", "ul", "ol", "table", "article"],
+                    recursive=True,
+                ))
+                # Do not climb into the full job body. Action wrappers are small
+                # and contain only action text/buttons; content wrappers have real
+                # headings, paragraphs, lists, or tables.
+                if text_len(parent) > 250 or has_content_children or not action_only:
+                    break
+                block = parent
+            return block
+
         cutoff = None
         for el in soup.find_all(True):
-            if (el.get("id") or "").strip().lower() == "asbranding":
-                cutoff = el
-                break
             if is_cutoff(el):
                 cutoff = el
                 break
@@ -1648,16 +1684,16 @@ class JobScraper:
         if not cutoff:
             return
 
-        block = cutoff
-        for parent in cutoff.parents:
-            if not getattr(parent, "name", None) or parent.name in ("[document]", "body", "main"):
-                break
-            if parent.name in ("div", "section", "aside", "form", "p", "li"):
-                block = parent
-                break
+        block = select_action_block(cutoff)
+        previous_text = ""
+        for sibling in block.find_previous_siblings():
+            previous_text = sibling.get_text(" ", strip=True) + " " + previous_text
 
-        for sibling in list(block.find_next_siblings()):
-            sibling.decompose()
+        # If an Apply control appears before the job content, removing all following
+        # siblings would blank the rendered job. In that case remove only the action block.
+        if len(previous_text.strip()) > 200:
+            for sibling in list(block.find_next_siblings()):
+                sibling.decompose()
         block.decompose()
 
     async def _extract_html_content_with_styles(self, html: str, base_url: str) -> Optional[str]:
@@ -1673,10 +1709,9 @@ class JobScraper:
                 driver = self._setup_selenium_driver()
                 self._selenium_navigate(driver, base_url)
                 
-                # Wait for page to load
+                # Keep this close to the original working renderer: let the detail
+                # page settle, then scroll once so lazy sections compute their styles.
                 time.sleep(2)
-                
-                # Scroll to ensure all elements are rendered
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(1)
                 
@@ -2312,13 +2347,9 @@ class JobScraper:
             job_data = await self._extract_job_data_with_ai(result.html, job_url)
             
             if self.include_html_content:
-                # API fast mode already has rendered HTML from Crawl4AI. Avoid a
-                # second Selenium navigation per job; inline styles from available
-                # HTML/CSS instead. Deep/non-fast mode keeps computed-style Selenium.
-                if self.fast_mode:
-                    html_content = await self._extract_html_content_with_styles_fallback(result.html, job_url)
-                else:
-                    html_content = await self._extract_html_content_with_styles(result.html, job_url)
+                # Use browser-computed styles for accurate rendering. The fallback
+                # CSS parser is faster but can miss complex external/ATS styles.
+                html_content = await self._extract_html_content_with_styles(result.html, job_url)
                 if html_content:
                     job_data["html_content"] = html_content
             

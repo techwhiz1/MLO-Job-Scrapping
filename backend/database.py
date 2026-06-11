@@ -103,11 +103,13 @@ class Database:
                     SELECT column_name
                     FROM information_schema.columns
                     WHERE table_name = 'JobPost'
-                      AND column_name IN ('source_url', 'sourceURL')
+                      AND column_name IN ('sourceUrl', 'source_url', 'sourceURL')
                 """)
-                columns = [row["column_name"] for row in column_rows]
+                available_columns = {row["column_name"] for row in column_rows}
+                preferred_order = ("sourceUrl", "source_url", "sourceURL")
+                columns = [column for column in preferred_order if column in available_columns]
                 if not columns:
-                    logger.warning("No source_url/sourceURL column exists in JobPost table. Returning empty set.")
+                    logger.warning("No sourceUrl/source_url/sourceURL column exists in JobPost table. Returning empty set.")
                     return set()
 
                 source_expr = "COALESCE(" + ", ".join(f'"{column}"' for column in columns) + ")"
@@ -121,9 +123,9 @@ class Database:
                 return source_urls
         except Exception as e:
             logger.error(f"Error fetching scraped source URLs: {str(e)}")
-            # If source_url column doesn't exist, return empty set
-            if "column \"source_url\" does not exist" in str(e).lower():
-                logger.warning("source_url column does not exist in JobPost table. Returning empty set.")
+            # If source URL columns don't exist, return empty set
+            if "column \"source" in str(e).lower() and "does not exist" in str(e).lower():
+                logger.warning("source URL column does not exist in JobPost table. Returning empty set.")
                 return set()
             raise
 

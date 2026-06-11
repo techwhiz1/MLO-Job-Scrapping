@@ -136,7 +136,7 @@ async def process_career_feed_config(db: Database, config: Dict[str, Any]) -> in
         
         try:
             # Scrape jobs from the feed URL
-            jobs = await scraper.scrape_jobs(feed_url)
+            jobs = await scraper.scrape_jobs(feed_url, existing_source_urls=scraped_urls)
             logger.info(f"Scraped {len(jobs)} jobs from {feed_url}")
             
             # Filter out already scraped jobs

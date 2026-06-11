@@ -74,6 +74,23 @@ const JobResultsTable = ({ jobs }) => {
     return text.substring(0, maxLength) + '...';
   };
 
+  const buildHtmlPreview = (html) => {
+    if (!html) return '';
+    return `<!doctype html>
+<html>
+  <head>
+    <base target="_blank" />
+    <style>
+      html, body { margin: 0; padding: 0; background: #fff; }
+      body { font-family: Arial, Helvetica, sans-serif; line-height: 1.45; }
+      img { max-width: 100%; height: auto; }
+      * { box-sizing: border-box; }
+    </style>
+  </head>
+  <body>${html}</body>
+</html>`;
+  };
+
   if (!jobs || jobs.length === 0) {
     return (
       <div className="text-center py-8">
@@ -229,6 +246,17 @@ const JobResultsTable = ({ jobs }) => {
                               <strong>Full Description:</strong>
                               <p className="mt-1 text-gray-700">{job.job_description || 'N/A'}</p>
                             </div>
+                            {job.html_content && (
+                              <div className="md:col-span-2">
+                                <strong>Original Styled Content:</strong>
+                                <iframe
+                                  title={`Job content ${globalIndex + 1}`}
+                                  srcDoc={buildHtmlPreview(job.html_content)}
+                                  className="mt-2 w-full h-96 rounded border border-gray-200 bg-white"
+                                  sandbox="allow-popups allow-popups-to-escape-sandbox"
+                                />
+                              </div>
+                            )}
                             {job.image_url && (
                               <div className="md:col-span-2">
                                 <strong>Image:</strong>
