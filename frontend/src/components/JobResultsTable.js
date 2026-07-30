@@ -14,6 +14,9 @@ const JobResultsTable = ({ jobs }) => {
     { label: 'Job Title', key: 'job_title' },
     { label: 'Job ID', key: 'job_id' },
     { label: 'Location', key: 'location' },
+    { label: 'City', key: 'city' },
+    { label: 'State/Province', key: 'state' },
+    { label: 'Country', key: 'country' },
     { label: 'Salary Range', key: 'salary_range' },
     { label: 'Application Deadline', key: 'application_deadline' },
     { label: 'Job Description', key: 'job_description' },
@@ -217,6 +220,15 @@ const JobResultsTable = ({ jobs }) => {
                             </div>
                             <div>
                               <strong>Application Deadline:</strong> {job.application_deadline || 'N/A'}
+                            </div>
+                            <div>
+                              <strong>City:</strong> {job.city || 'N/A'}
+                            </div>
+                            <div>
+                              <strong>State/Province:</strong> {job.state || 'N/A'}
+                            </div>
+                            <div>
+                              <strong>Country:</strong> {job.country || 'N/A'}
                             </div>
                             <div>
                               <strong>Years of Experience:</strong> {job.preferred_years_of_experience || 'N/A'}

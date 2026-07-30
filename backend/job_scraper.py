@@ -33,6 +33,115 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class JobScraper:
+    US_STATES = {
+        "al": "Alabama", "alabama": "Alabama",
+        "ak": "Alaska", "alaska": "Alaska",
+        "az": "Arizona", "arizona": "Arizona",
+        "ar": "Arkansas", "arkansas": "Arkansas",
+        "ca": "California", "california": "California",
+        "co": "Colorado", "colorado": "Colorado",
+        "ct": "Connecticut", "connecticut": "Connecticut",
+        "de": "Delaware", "delaware": "Delaware",
+        "fl": "Florida", "florida": "Florida",
+        "ga": "Georgia", "georgia": "Georgia",
+        "hi": "Hawaii", "hawaii": "Hawaii",
+        "id": "Idaho", "idaho": "Idaho",
+        "il": "Illinois", "illinois": "Illinois",
+        "in": "Indiana", "indiana": "Indiana",
+        "ia": "Iowa", "iowa": "Iowa",
+        "ks": "Kansas", "kansas": "Kansas",
+        "ky": "Kentucky", "kentucky": "Kentucky",
+        "la": "Louisiana", "louisiana": "Louisiana",
+        "me": "Maine", "maine": "Maine",
+        "md": "Maryland", "maryland": "Maryland",
+        "ma": "Massachusetts", "massachusetts": "Massachusetts",
+        "mi": "Michigan", "michigan": "Michigan",
+        "mn": "Minnesota", "minnesota": "Minnesota",
+        "ms": "Mississippi", "mississippi": "Mississippi",
+        "mo": "Missouri", "missouri": "Missouri",
+        "mt": "Montana", "montana": "Montana",
+        "ne": "Nebraska", "nebraska": "Nebraska",
+        "nv": "Nevada", "nevada": "Nevada",
+        "nh": "New Hampshire", "new hampshire": "New Hampshire",
+        "nj": "New Jersey", "new jersey": "New Jersey",
+        "nm": "New Mexico", "new mexico": "New Mexico",
+        "ny": "New York", "new york": "New York",
+        "nc": "North Carolina", "north carolina": "North Carolina",
+        "nd": "North Dakota", "north dakota": "North Dakota",
+        "oh": "Ohio", "ohio": "Ohio",
+        "ok": "Oklahoma", "oklahoma": "Oklahoma",
+        "or": "Oregon", "oregon": "Oregon",
+        "pa": "Pennsylvania", "pennsylvania": "Pennsylvania",
+        "ri": "Rhode Island", "rhode island": "Rhode Island",
+        "sc": "South Carolina", "south carolina": "South Carolina",
+        "sd": "South Dakota", "south dakota": "South Dakota",
+        "tn": "Tennessee", "tennessee": "Tennessee",
+        "tx": "Texas", "texas": "Texas",
+        "ut": "Utah", "utah": "Utah",
+        "vt": "Vermont", "vermont": "Vermont",
+        "va": "Virginia", "virginia": "Virginia",
+        "wa": "Washington", "washington": "Washington",
+        "wv": "West Virginia", "west virginia": "West Virginia",
+        "wi": "Wisconsin", "wisconsin": "Wisconsin",
+        "wy": "Wyoming", "wyoming": "Wyoming",
+        "dc": "District of Columbia", "district of columbia": "District of Columbia",
+        "washington dc": "District of Columbia",
+    }
+    CANADA_PROVINCES = {
+        "ab": "Alberta", "alberta": "Alberta",
+        "bc": "British Columbia", "b.c.": "British Columbia", "british columbia": "British Columbia",
+        "mb": "Manitoba", "manitoba": "Manitoba",
+        "nb": "New Brunswick", "new brunswick": "New Brunswick",
+        "nl": "Newfoundland and Labrador", "newfoundland": "Newfoundland and Labrador",
+        "newfoundland and labrador": "Newfoundland and Labrador",
+        "ns": "Nova Scotia", "nova scotia": "Nova Scotia",
+        "nt": "Northwest Territories", "northwest territories": "Northwest Territories",
+        "nu": "Nunavut", "nunavut": "Nunavut",
+        "on": "Ontario", "ontario": "Ontario",
+        "pe": "Prince Edward Island", "pei": "Prince Edward Island",
+        "prince edward island": "Prince Edward Island",
+        "qc": "Quebec", "pq": "Quebec", "québec": "Quebec", "quebec": "Quebec",
+        "sk": "Saskatchewan", "saskatchewan": "Saskatchewan",
+        "yt": "Yukon", "yk": "Yukon", "yukon": "Yukon",
+    }
+    COUNTRY_ALIASES = {
+        "ca": "Canada", "can": "Canada", "canada": "Canada",
+        "us": "United States", "usa": "United States", "u.s.": "United States",
+        "u.s.a.": "United States", "united states": "United States",
+        "united states of america": "United States", "america": "United States",
+    }
+    CITY_LOCATION_HINTS = {
+        "val-d'or": ("Val-d'Or", "Quebec", "Canada"),
+        "val d'or": ("Val-d'Or", "Quebec", "Canada"),
+        "toronto": ("Toronto", "Ontario", "Canada"),
+        "vancouver": ("Vancouver", "British Columbia", "Canada"),
+        "montreal": ("Montreal", "Quebec", "Canada"),
+        "montréal": ("Montreal", "Quebec", "Canada"),
+        "calgary": ("Calgary", "Alberta", "Canada"),
+        "edmonton": ("Edmonton", "Alberta", "Canada"),
+        "ottawa": ("Ottawa", "Ontario", "Canada"),
+        "winnipeg": ("Winnipeg", "Manitoba", "Canada"),
+        "halifax": ("Halifax", "Nova Scotia", "Canada"),
+        "mississauga": ("Mississauga", "Ontario", "Canada"),
+        "sudbury": ("Sudbury", "Ontario", "Canada"),
+        "lively": ("Lively", "Ontario", "Canada"),
+        "denver": ("Denver", "Colorado", "United States"),
+        "boston": ("Boston", "Massachusetts", "United States"),
+        "chicago": ("Chicago", "Illinois", "United States"),
+        "houston": ("Houston", "Texas", "United States"),
+        "phoenix": ("Phoenix", "Arizona", "United States"),
+        "philadelphia": ("Philadelphia", "Pennsylvania", "United States"),
+        "san antonio": ("San Antonio", "Texas", "United States"),
+        "san diego": ("San Diego", "California", "United States"),
+        "dallas": ("Dallas", "Texas", "United States"),
+        "san jose": ("San Jose", "California", "United States"),
+        "austin": ("Austin", "Texas", "United States"),
+        "seattle": ("Seattle", "Washington", "United States"),
+        "portland": ("Portland", "Oregon", "United States"),
+        "nashville": ("Nashville", "Tennessee", "United States"),
+        "oklahoma city": ("Oklahoma City", "Oklahoma", "United States"),
+    }
+
     def __init__(
         self,
         filter_location: bool = False,
@@ -40,6 +149,7 @@ class JobScraper:
         save_debug_html: Optional[bool] = None,
         fast_mode: bool = False,
         categories: Optional[List[Dict]] = None,
+        country_and_states: Optional[List[Dict]] = None,
     ):
         # Set OpenAI API key
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -52,6 +162,7 @@ class JobScraper:
         self.include_html_content = include_html_content
         self.fast_mode = fast_mode
         self.categories = categories or []
+        self.country_and_states = country_and_states or []
         self.save_debug_html = (
             save_debug_html
             if save_debug_html is not None
@@ -88,8 +199,177 @@ class JobScraper:
             return value.lower() in ("1", "true", "yes", "on")
         return self.fast_mode
 
+    def _clean_location_part(self, value: str) -> str:
+        value = re.sub(r"\s+", " ", str(value or "")).strip(" ,|-")
+        value = re.sub(r"\b(?:remote|hybrid|onsite|on-site|full[- ]time|part[- ]time)\b", "", value, flags=re.I)
+        value = re.sub(r"\s+", " ", value).strip(" ,|-")
+        return value
+
+    def _normalize_country_name(self, value: str) -> str:
+        value = self._clean_location_part(value)
+        return self.COUNTRY_ALIASES.get(value.lower().strip("."), value)
+
+    def _normalize_state_name(self, value: str, country: str = "") -> str:
+        value = self._clean_location_part(value)
+        key = value.lower().strip(".")
+        country_key = (country or "").lower()
+        if country_key == "canada" or key in self.CANADA_PROVINCES:
+            return self.CANADA_PROVINCES.get(key, value)
+        if country_key == "united states" or key in self.US_STATES:
+            return self.US_STATES.get(key, value)
+        return value
+
+    def _country_from_state(self, state: str) -> str:
+        key = self._clean_location_part(state).lower().strip(".")
+        if key in self.CANADA_PROVINCES or state in self.CANADA_PROVINCES.values():
+            return "Canada"
+        if key in self.US_STATES or state in self.US_STATES.values():
+            return "United States"
+        return ""
+
+    def _infer_city_hint(self, city: str) -> Tuple[str, str, str]:
+        key = self._clean_location_part(city).lower()
+        return self.CITY_LOCATION_HINTS.get(key, ("", "", ""))
+
+    def _country_state_id(self, row: Dict):
+        return row.get("id")
+
+    def _country_state_name(self, row: Dict) -> str:
+        return str(row.get("name") or row.get("title") or row.get("label") or "")
+
+    def _country_state_code(self, row: Dict) -> str:
+        return str(row.get("code") or row.get("abbreviation") or "")
+
+    def _country_state_parent_id(self, row: Dict):
+        for key in ("parentId", "parent_id", "parentID", "parent"):
+            value = row.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    def _location_lookup_key(self, value: str) -> str:
+        value = self._clean_location_part(value).lower()
+        value = self.COUNTRY_ALIASES.get(value.strip("."), value)
+        return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+    def _match_country_state_ids(self, state_name: str, country_name: str) -> Tuple[object, object]:
+        if not self.country_and_states:
+            return None, None
+
+        countries = [
+            row for row in self.country_and_states
+            if self._country_state_parent_id(row) in (None, "")
+        ]
+        states = [
+            row for row in self.country_and_states
+            if self._country_state_parent_id(row) not in (None, "")
+        ]
+
+        country_key = self._location_lookup_key(self._normalize_country_name(country_name))
+        country_id = None
+        if country_key:
+            for country in countries:
+                row_keys = {
+                    self._location_lookup_key(self._country_state_name(country)),
+                    self._location_lookup_key(self._country_state_code(country)),
+                    self._location_lookup_key(self._normalize_country_name(self._country_state_code(country))),
+                }
+                if country_key in row_keys:
+                    country_id = self._country_state_id(country)
+                    break
+
+        state_key = self._location_lookup_key(state_name)
+        state_id = None
+        if state_key:
+            for state in states:
+                if country_id is not None and str(self._country_state_parent_id(state)) != str(country_id):
+                    continue
+                row_keys = {
+                    self._location_lookup_key(self._country_state_name(state)),
+                    self._location_lookup_key(self._country_state_code(state)),
+                }
+                if state_key in row_keys:
+                    state_id = self._country_state_id(state)
+                    if country_id is None:
+                        country_id = self._country_state_parent_id(state)
+                    break
+
+        return state_id, country_id
+
+    def _standardize_location_fields(self, job_data: Dict) -> None:
+        """
+        Normalize location into city/town, province/state, country and expose
+        separate city/state/country fields. Uses source/AI data first, then
+        fills missing country/state from known state/province/city hints.
+        """
+        raw_location = self._clean_location_part(job_data.get("location", ""))
+        city = self._clean_location_part(job_data.get("city", ""))
+        state = self._clean_location_part(job_data.get("state", "") or job_data.get("province", ""))
+        country = self._normalize_country_name(job_data.get("country", ""))
+
+        location_without_postal = re.sub(
+            r"\b[A-Z]\d[A-Z][ -]?\d[A-Z]\d\b|\b\d{5}(?:-\d{4})?\b",
+            "",
+            raw_location,
+            flags=re.I,
+        )
+        parts = [
+            self._clean_location_part(part)
+            for part in re.split(r"\s*(?:,|\||/|\u2022| - )\s*", location_without_postal)
+            if self._clean_location_part(part)
+        ]
+
+        if parts:
+            last_country = self._normalize_country_name(parts[-1])
+            if not country and last_country in ("Canada", "United States"):
+                country = last_country
+                parts = parts[:-1]
+
+        if len(parts) >= 2:
+            possible_state = self._normalize_state_name(parts[-1], country)
+            if not state:
+                state = possible_state
+            if not city:
+                city = parts[-2] if len(parts) > 2 and possible_state == parts[-1] else parts[0]
+        elif len(parts) == 1:
+            only_part = parts[0]
+            normalized_state = self._normalize_state_name(only_part, country)
+            inferred_country = self._country_from_state(normalized_state)
+            if inferred_country and not state:
+                state = normalized_state
+            elif not city:
+                city = only_part
+
+        state = self._normalize_state_name(state, country)
+        if not country:
+            country = self._country_from_state(state)
+
+        if city and (not state or not country):
+            hint_city, hint_state, hint_country = self._infer_city_hint(city)
+            if hint_city:
+                city = hint_city
+                state = state or hint_state
+                country = country or hint_country
+
+        if state and not country:
+            country = self._country_from_state(state)
+
+        standardized = ", ".join(part for part in (city, state, country) if part)
+        state_id, country_id = self._match_country_state_ids(state, country)
+        job_data["city"] = city
+        job_data["state"] = state_id if state_id is not None else state
+        job_data["country"] = country_id if country_id is not None else country
+        job_data["location"] = standardized or raw_location
+
     def _category_id(self, category: Dict) -> str:
         for key in ("id", "categoryId", "category_id", "value", "uuid"):
+            value = category.get(key)
+            if value:
+                return str(value)
+        return ""
+
+    def _category_parent_id(self, category: Dict) -> str:
+        for key in ("parent_category_id", "parentCategoryId", "parent_id", "parentId", "parent"):
             value = category.get(key)
             if value:
                 return str(value)
@@ -102,19 +382,52 @@ class JobScraper:
                 return str(value)
         return self._category_id(category)
 
-    def _format_categories_for_prompt(self) -> str:
+    def _selectable_categories(self) -> List[Dict]:
+        """
+        Return only categories that can be assigned to a job.
+        With parent_category_id tree data, this means leaf/child categories only.
+        """
         if not self.categories:
-            return "No categories were provided. Return null for category_id and category_name."
+            return []
+
+        child_categories = [
+            category
+            for category in self.categories
+            if self._category_id(category) and self._category_parent_id(category)
+        ]
+
+        # If the table has tree data, only child rows are valid choices.
+        if child_categories:
+            return child_categories
+
+        return self.categories
+
+    def _category_parent_name(self, category: Dict) -> str:
+        parent_id = self._category_parent_id(category)
+        if not parent_id:
+            return ""
+        for possible_parent in self.categories:
+            if self._category_id(possible_parent) == parent_id:
+                return self._category_name(possible_parent)
+        return ""
+
+    def _format_categories_for_prompt(self) -> str:
+        selectable_categories = self._selectable_categories()
+        if not selectable_categories:
+            return "No child/leaf categories were provided. Return null for category_id and category_name."
         lines = []
-        for category in self.categories:
+        for category in selectable_categories:
             category_id = self._category_id(category)
             category_name = self._category_name(category)
             if category_id or category_name:
-                lines.append(f"- id: {category_id}; name: {category_name}")
-        return "\n".join(lines) if lines else "No categories were provided. Return null for category_id and category_name."
+                parent_name = self._category_parent_name(category)
+                parent_part = f"; parent: {parent_name}" if parent_name else ""
+                lines.append(f"- id: {category_id}; name: {category_name}{parent_part}")
+        return "\n".join(lines) if lines else "No child/leaf categories were provided. Return null for category_id and category_name."
 
     def _normalize_extracted_category(self, job_data: Dict) -> None:
-        if not self.categories:
+        selectable_categories = self._selectable_categories()
+        if not selectable_categories:
             job_data["category_id"] = ""
             job_data["category_name"] = ""
             return
@@ -122,7 +435,7 @@ class JobScraper:
         extracted_id = (job_data.get("category_id") or "").strip().lower()
         extracted_name = (job_data.get("category_name") or job_data.get("category") or "").strip().lower()
 
-        for category in self.categories:
+        for category in selectable_categories:
             category_id = self._category_id(category)
             category_name = self._category_name(category)
             if (
@@ -141,8 +454,10 @@ class JobScraper:
             "key_responsibilities",
             "qualifications_and_skills",
             "required_experience",
+            "educational_level",
+            "certification_level",
         )).lower()
-        for category in self.categories:
+        for category in selectable_categories:
             category_name = self._category_name(category)
             if category_name and category_name.lower() in haystack:
                 job_data["category_id"] = self._category_id(category)
@@ -151,6 +466,88 @@ class JobScraper:
 
         job_data["category_id"] = ""
         job_data["category_name"] = ""
+
+    def _normalize_job_record_for_category_detection(self, job_record: Dict) -> Dict:
+        return {
+            "job_title": job_record.get("job_title") or job_record.get("jobTitle") or "",
+            "job_description": job_record.get("job_description") or job_record.get("description") or "",
+            "key_responsibilities": job_record.get("key_responsibilities") or job_record.get("keyResponsibilities") or "",
+            "qualifications_and_skills": job_record.get("qualifications_and_skills") or job_record.get("qualifications") or "",
+            "educational_level": job_record.get("educational_level") or job_record.get("educationLevel") or "",
+            "certification_level": job_record.get("certification_level") or job_record.get("certificationLevel") or "",
+            "required_experience": job_record.get("required_experience") or job_record.get("requiredExperience") or "",
+        }
+
+    async def detect_child_category_for_job(self, job_record: Dict) -> Dict:
+        """Detect exactly one child/leaf category for an existing JobPost record."""
+        normalized_job = self._normalize_job_record_for_category_detection(job_record)
+        category_options = self._format_categories_for_prompt()
+        job_text = "\n".join(
+            f"{label}: {normalized_job.get(key, '')}"
+            for label, key in (
+                ("Job title", "job_title"),
+                ("Description", "job_description"),
+                ("Key responsibilities", "key_responsibilities"),
+                ("Qualifications", "qualifications_and_skills"),
+                ("Education level", "educational_level"),
+                ("Certification level", "certification_level"),
+                ("Required experience", "required_experience"),
+            )
+            if normalized_job.get(key)
+        )
+
+        if not self._selectable_categories():
+            return {"category_id": "", "category_name": ""}
+
+        prompt = f"""
+        Choose exactly one child/leaf category for this job. Return only valid JSON with:
+        - category_id
+        - category_name
+
+        Child/leaf category list. Choose only from this list. Do not choose parent categories:
+        {category_options}
+
+        Job content:
+        {job_text}
+
+        Return the single best matching child/leaf category. Do not invent a category.
+        """
+
+        try:
+            response = await self.openai_client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You classify jobs into exactly one provided child category and return valid JSON.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=300,
+                temperature=0.1,
+            )
+            content = response.choices[0].message.content.strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.endswith("```"):
+                content = content[:-3]
+            detected = json.loads(content)
+        except Exception as e:
+            logger.warning(f"AI category detection failed; using deterministic fallback: {e}")
+            detected = {}
+        if not isinstance(detected, dict):
+            detected = {}
+
+        category_data = {
+            **normalized_job,
+            "category_id": str(detected.get("category_id") or ""),
+            "category_name": str(detected.get("category_name") or detected.get("category") or ""),
+        }
+        self._normalize_extracted_category(category_data)
+        return {
+            "category_id": category_data.get("category_id", ""),
+            "category_name": category_data.get("category_name", ""),
+        }
 
     def _apply_selenium_driver_timeouts(self, driver) -> None:
         """Apply timeouts so navigation/scripts don't hang forever; extend chromedriver HTTP timeout."""
@@ -1589,6 +1986,7 @@ class JobScraper:
         """
         if not html_content or not html_content.strip():
             return html_content
+        original_html_content = html_content
         try:
             # Fix encoding artifacts: "Â" before non-breaking spaces (UTF-8 double-encoding)
             html_content = html_content.replace("\u00c2\u00a0", "\u00a0")  # Â + nbsp → nbsp
@@ -1597,7 +1995,7 @@ class JobScraper:
             html_content = re.sub(r"\u00c2(?=\s|<|&)", "", html_content)
 
             soup = BeautifulSoup(html_content, "html.parser")
-            self._remove_apply_refer_and_branding_tail(soup)
+            self._remove_non_job_detail_sections(soup)
             for paragraph in list(soup.find_all("p")):
                 text = paragraph.get_text("", strip=True).replace("\u00a0", "").strip()
                 if not text and not paragraph.find(["img", "video", "iframe", "object", "embed", "br"]):
@@ -1623,26 +2021,90 @@ class JobScraper:
                     if "-webkit-text-fill-color" not in updated:
                         updated = updated.rstrip().rstrip(";") + "; -webkit-text-fill-color: white !important;"
                     el["style"] = updated
-            return str(soup)
+            processed_html = str(soup)
+            if not processed_html.strip() and original_html_content.strip():
+                logger.warning("html_content cleanup produced empty output; returning untrimmed content")
+                return original_html_content
+            return processed_html
         except Exception as e:
             logger.warning(f"html_content post-process skipped: {e}")
             return html_content
 
-    def _remove_apply_refer_and_branding_tail(self, soup: BeautifulSoup) -> None:
+    def _remove_non_job_detail_sections(self, soup: BeautifulSoup) -> None:
         """
-        Remove exact Apply Now / Refer to a Friend controls and following action area.
-        This targets visible button/link text, not broad attributes or ordinary text.
+        Remove action controls, ATS branding, breadcrumbs, and related-job navigation
+        from a detailed job page while preserving the main job description body.
         """
-        action_text_re = re.compile(r"^\s*(apply\s+now|refer\s+to\s+a\s+friend)\s*$", re.I)
+        action_text_re = re.compile(
+            r"^\s*(apply(?:\s+now|\s+online|\s+for\s+this\s+job|\s+to\s+this\s+job)?|refer\s+to\s+a\s+friend)\W*$",
+            re.I,
+        )
+        related_heading_re = re.compile(
+            r"^\s*(similar|related|recommended)\s+jobs?\b|^\s*jobs\s+you\s+may\s+like\b|^\s*more\s+jobs\s+like\s+this\b",
+            re.I,
+        )
+        jobs_nav_re = re.compile(
+            r"^\s*(all\s+jobs|view\s+all\s+jobs|see\s+all\s+jobs|back\s+to\s+(?:all\s+)?jobs)\s*$",
+            re.I,
+        )
+        related_attr_re = re.compile(
+            r"(similar|related|recommended)[\s_-]*jobs?|jobs[\s_-]*you[\s_-]*may[\s_-]*like|all[\s_-]*jobs",
+            re.I,
+        )
+        apply_attr_re = re.compile(
+            r"(?:^|[\s_-])(social[\s_-]*apply|dialogapplybtn|applyoption|applylistitemoption|"
+            r"apply[\s_-]*(?:button|btn|container|link|option)|btn[\s_-]*social[\s_-]*apply)(?:$|[\s_-])|"
+            r"/talentcommunity/apply/|start\s+applying|start\s+the\s+apply\s+process|"
+            r"enter\s+email\s+to\s+start\s+application\s+process",
+            re.I,
+        )
 
-        for branding in list(soup.find_all(id=lambda value: value and str(value).strip().lower() in ("asbranding", "asbreadcrumbs"))):
-            branding.decompose()
+        def element_attr_text(el) -> str:
+            parts = []
+            for attr in (
+                "id",
+                "class",
+                "href",
+                "aria-label",
+                "title",
+                "data-testid",
+                "data-automation",
+                "data-test",
+                "data-ht",
+                "placeholder",
+                "action",
+            ):
+                value = el.get(attr)
+                if isinstance(value, list):
+                    parts.extend(str(item) for item in value)
+                elif value:
+                    parts.append(str(value))
+            return " ".join(parts)
+
+        for element in list(soup.find_all(True)):
+            if not getattr(element, "parent", None):
+                continue
+            element_id = str(element.get("id", "")).strip().lower()
+            if element_id in ("asbranding", "asbreadcrumbs"):
+                element.decompose()
+                continue
+            attrs = element_attr_text(element)
+            if apply_attr_re.search(attrs):
+                block = self._select_apply_block(element)
+                block.decompose()
+                continue
+            if related_attr_re.search(attrs):
+                block = self._select_related_jobs_block(element)
+                block.decompose()
 
         def is_cutoff(el) -> bool:
             if not getattr(el, "name", None):
                 return False
             text = el.get_text(" ", strip=True)
-            if (el.name in ("a", "button") or el.get("role") == "button") and action_text_re.match(text or ""):
+            labels = " ".join(str(el.get(attr, "")) for attr in ("aria-label", "title", "value"))
+            if (el.name in ("a", "button") or el.get("role") == "button") and (
+                action_text_re.match(text or "") or action_text_re.match(labels.strip())
+            ):
                 return True
             if el.name == "input" and action_text_re.match(str(el.get("value", ""))):
                 return True
@@ -1660,7 +2122,7 @@ class JobScraper:
                     continue
                 parent_text = parent.get_text(" ", strip=True)
                 action_only = re.fullmatch(
-                    r"(?is)\s*(apply\s+now|refer\s+to\s+a\s+friend)(\s+(apply\s+now|refer\s+to\s+a\s+friend))*\s*",
+                    r"(?is)\s*(apply(?:\s+now|\s+online|\s+for\s+this\s+job|\s+to\s+this\s+job)?|refer\s+to\s+a\s+friend)\W*(\s+(apply(?:\s+now|\s+online|\s+for\s+this\s+job|\s+to\s+this\s+job)?|refer\s+to\s+a\s+friend)\W*)*\s*",
                     parent_text or "",
                 )
                 has_content_children = bool(parent.find(
@@ -1675,26 +2137,80 @@ class JobScraper:
                 block = parent
             return block
 
-        cutoff = None
-        for el in soup.find_all(True):
-            if is_cutoff(el):
-                cutoff = el
+        for el in list(soup.find_all(True)):
+            if not getattr(el, "parent", None):
+                continue
+            if not is_cutoff(el):
+                continue
+
+            block = select_action_block(el)
+            block.decompose()
+
+        for el in list(soup.find_all(True)):
+            if not getattr(el, "parent", None):
+                continue
+            text = el.get_text(" ", strip=True)
+            if related_heading_re.match(text or "") or jobs_nav_re.match(text or ""):
+                block = self._select_related_jobs_block(el)
+                block.decompose()
+
+    def _select_apply_block(self, el):
+        """Choose the apply/social-apply wrapper without climbing into the job body."""
+        apply_container_re = re.compile(
+            r"(social[\s_-]*apply[\s_-]*button[\s_-]*container|btn[\s_-]*social[\s_-]*apply|"
+            r"socialbutton|emailgetter|applylistitemoption|applyoption|dialogapplybtn)",
+            re.I,
+        )
+        block = el
+        for parent in el.parents:
+            if not getattr(parent, "name", None) or parent.name in ("[document]", "body", "main", "article"):
                 break
+            parent_attrs = " ".join(
+                str(parent.get(attr, ""))
+                for attr in ("id", "class", "aria-label", "title", "data-testid", "data-automation", "data-test")
+            )
+            parent_text = parent.get_text(" ", strip=True)
+            if apply_container_re.search(parent_attrs):
+                block = parent
+                continue
+            if parent.name in ("div", "section", "aside", "form", "ul", "li") and len(parent_text) <= 1200:
+                block = parent
+                continue
+            break
+        return block
 
-        if not cutoff:
-            return
-
-        block = select_action_block(cutoff)
-        previous_text = ""
-        for sibling in block.find_previous_siblings():
-            previous_text = sibling.get_text(" ", strip=True) + " " + previous_text
-
-        # If an Apply control appears before the job content, removing all following
-        # siblings would blank the rendered job. In that case remove only the action block.
-        if len(previous_text.strip()) > 200:
-            for sibling in list(block.find_next_siblings()):
-                sibling.decompose()
-        block.decompose()
+    def _select_related_jobs_block(self, el):
+        """Choose a small related-jobs/navigation container without climbing into the main body."""
+        job_body_re = re.compile(
+            r"\b(job\s+description|responsibilities|qualifications|requirements|required\s+experience|"
+            r"skills|benefits|about\s+the\s+role|purpose\s+of\s+the\s+role)\b",
+            re.I,
+        )
+        block = el
+        for parent in el.parents:
+            if not getattr(parent, "name", None) or parent.name in ("[document]", "body", "main", "article"):
+                break
+            parent_text = parent.get_text(" ", strip=True)
+            if len(parent_text) > 800 and job_body_re.search(parent_text):
+                break
+            parent_attrs = " ".join(
+                str(parent.get(attr, ""))
+                for attr in ("id", "class", "aria-label", "title", "data-testid", "data-automation", "data-test")
+            )
+            if parent.name in ("section", "aside", "nav") or re.search(
+                r"(similar|related|recommended)[\s_-]*jobs?|all[\s_-]*jobs",
+                parent_attrs,
+                re.I,
+            ):
+                if len(parent_text) > 800 and job_body_re.search(parent_text):
+                    break
+                block = parent
+                break
+            if parent.name in ("div", "ul", "ol", "li") and len(parent_text) <= 1500:
+                block = parent
+                continue
+            break
+        return block
 
     async def _extract_html_content_with_styles(self, html: str, base_url: str) -> Optional[str]:
         """
@@ -2087,6 +2603,40 @@ class JobScraper:
         except Exception as e:
             logger.error(f"Error in fallback HTML extraction: {str(e)}")
             return None
+
+    def _extract_plain_html_content_fallback(self, html: str) -> str:
+        """Last-resort detail HTML fallback so API responses still include html_content."""
+        try:
+            soup = BeautifulSoup(html or "", "html.parser")
+            for element in soup(["script", "style", "noscript", "header", "footer"]):
+                element.decompose()
+
+            main_content = None
+            for selector in (
+                "main",
+                "[role='main']",
+                ".job-content",
+                ".job-details",
+                ".job-description",
+                "#job-content",
+                ".jobDisplayShell",
+                ".job-posting",
+                ".job-detail",
+                "article",
+            ):
+                main_content = soup.select_one(selector)
+                if main_content:
+                    break
+
+            if not main_content:
+                main_content = soup.find("body") or soup
+
+            self._remove_non_job_detail_sections(main_content)
+            cleaned = self._post_process_html_content(str(main_content))
+            return cleaned or ""
+        except Exception as e:
+            logger.warning(f"Plain html_content fallback failed: {e}")
+            return ""
     
     async def _extract_and_parse_css(self, soup: BeautifulSoup, base_url: str) -> Dict:
         """
@@ -2350,8 +2900,10 @@ class JobScraper:
                 # Use browser-computed styles for accurate rendering. The fallback
                 # CSS parser is faster but can miss complex external/ATS styles.
                 html_content = await self._extract_html_content_with_styles(result.html, job_url)
-                if html_content:
-                    job_data["html_content"] = html_content
+                if not html_content:
+                    logger.warning(f"Styled html_content extraction returned empty for {job_url}; using plain fallback")
+                    html_content = self._extract_plain_html_content_fallback(result.html)
+                job_data["html_content"] = html_content or ""
             
             return job_data
                 
@@ -2368,6 +2920,8 @@ class JobScraper:
         # Remove script and style elements
         for script in soup(["script", "style"]):
             script.decompose()
+
+        self._remove_non_job_detail_sections(soup)
         
         # Get text content and limit length. A 4k character cutoff often misses
         # qualifications/benefits on longer ATS pages, so keep a larger window.
@@ -2385,7 +2939,10 @@ class JobScraper:
         - job_title: Job position title
         - job_id: Job ID or reference number if available
         - job_description: Brief job description/summary
-        - location: Job location (city, state, country)
+        - location: Standard job location as "city/town, province/state, country"
+        - city: Job city or town
+        - state: Job province or state
+        - country: Job country
         - salary_range: Salary range or compensation details
         - application_deadline: Application deadline date
         - image_url: Company logo or job-related image URL
@@ -2397,19 +2954,20 @@ class JobScraper:
         - educational_level: Education requirements
         - certification_level: Required certifications
         - interview_format: Interview process information
-        - category_id: The id of exactly one category selected from the category list below
-        - category_name: The name of exactly one category selected from the category list below
+        - category_id: The id of exactly one child/leaf category selected from the category list below
+        - category_name: The name of exactly one child/leaf category selected from the category list below
 
         Job URL: {job_url}
 
-        Category list:
+        Child/leaf category list. Choose exactly one from this list only. Do not choose a parent category:
         {category_options}
         
         Job Content:
         {text_content}
         
         Return only valid JSON. If a field is not found, use null as the value.
-        For category_id and category_name, choose the single best matching category from the Category list. Do not invent a category.
+        Normalize location to city/town, province/state, country. If the source page omits country, infer it from the province/state or city when obvious. If the source page omits province/state, infer it from the city when obvious.
+        For category_id and category_name, choose the single best matching child/leaf category from the category list. Do not invent a category and do not return a parent category.
         """
         
         try:
@@ -2450,6 +3008,7 @@ class JobScraper:
                         cleaned_data[key] = str(value)
 
                 self._normalize_extracted_category(cleaned_data)
+                self._standardize_location_fields(cleaned_data)
                 
                 cleaned_data["source_url"] = job_url  # Add the job URL
                 return cleaned_data
@@ -2462,6 +3021,9 @@ class JobScraper:
                     "job_id": "",
                     "job_description": text_content[:200] + "..." if len(text_content) > 200 else text_content,
                     "location": "",
+                    "city": "",
+                    "state": "",
+                    "country": "",
                     "salary_range": "",
                     "application_deadline": "",
                     "image_url": "",
@@ -2485,9 +3047,12 @@ class JobScraper:
                 "employer": "",
                 "job_title": "Job Title Not Found",
                 "job_id": "",
-                "job_description": text_content[:200] + "..." if len(text_content) > 200 else text_content,
-                "location": "",
-                "salary_range": "",
+                    "job_description": text_content[:200] + "..." if len(text_content) > 200 else text_content,
+                    "location": "",
+                    "city": "",
+                    "state": "",
+                    "country": "",
+                    "salary_range": "",
                 "application_deadline": "",
                 "image_url": "",
                 "key_responsibilities": "",

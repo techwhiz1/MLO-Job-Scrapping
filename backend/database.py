@@ -162,6 +162,80 @@ class Database:
         except Exception as e:
             logger.error(f"Error fetching categories: {str(e)}")
             return []
+
+    async def get_country_and_states(self) -> List[Dict[str, Any]]:
+        """Fetch rows from CountryAndState for location id mapping."""
+        try:
+            async with self.pool.acquire() as conn:
+                table_name = await conn.fetchval("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = current_schema()
+                      AND table_name IN ('CountryAndState', 'CountryAndStates', 'country_and_state', 'country_and_states')
+                    ORDER BY CASE table_name
+                        WHEN 'CountryAndState' THEN 0
+                        WHEN 'CountryAndStates' THEN 1
+                        WHEN 'country_and_state' THEN 2
+                        ELSE 3
+                    END
+                    LIMIT 1
+                """)
+                if not table_name:
+                    logger.warning("CountryAndState table does not exist. Returning empty country/state list.")
+                    return []
+
+                rows = await conn.fetch(f'SELECT * FROM "{table_name}"')
+                country_states = []
+                for row in rows:
+                    try:
+                        country_states.append({key: row[key] for key in row.keys()})
+                    except (AttributeError, TypeError):
+                        country_states.append(dict(row))
+                logger.info(f"Fetched {len(country_states)} country/state rows from {table_name}")
+                return country_states
+        except Exception as e:
+            logger.error(f"Error fetching CountryAndState rows: {str(e)}")
+            return []
+
+    async def get_job_post_by_id(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch one JobPost row by primary id."""
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow('SELECT * FROM "JobPost" WHERE id = $1', job_id)
+                if not row:
+                    return None
+                try:
+                    return {key: row[key] for key in row.keys()}
+                except (AttributeError, TypeError):
+                    return dict(row)
+        except Exception as e:
+            logger.error(f"Error fetching JobPost by id {job_id}: {str(e)}")
+            raise
+
+    async def update_job_post_category(self, job_id: str, category_id: str) -> bool:
+        """Set JobPost.categoryId for a given job id."""
+        try:
+            category_id_int = int(category_id)
+            async with self.pool.acquire() as conn:
+                try:
+                    await conn.execute("""
+                        ALTER TABLE "JobPost"
+                        ADD COLUMN IF NOT EXISTS "categoryId" INTEGER
+                    """)
+                except Exception as e:
+                    logger.debug(f"categoryId column check: {str(e)}")
+
+                result = await conn.execute(
+                    'UPDATE "JobPost" SET "categoryId" = $1, "updatedAt" = NOW() WHERE id = $2',
+                    category_id_int,
+                    job_id,
+                )
+                updated_count = int(result.split()[-1]) if result and result.startswith("UPDATE") else 0
+                logger.info(f"Updated categoryId for {updated_count} JobPost row(s)")
+                return updated_count > 0
+        except Exception as e:
+            logger.error(f"Error updating JobPost categoryId for id {job_id}: {str(e)}")
+            raise
     
     async def insert_job_post(self, job_data: Dict[str, Any]) -> str:
         """
@@ -181,6 +255,9 @@ class Database:
             job_title = job_data.get('job_title', '') or job_data.get('jobTitle', '')
             description = job_data.get('job_description', '') or job_data.get('description', '')
             location = job_data.get('location', '')
+            city = job_data.get('city', '')
+            state = job_data.get('state', '')
+            country = job_data.get('country', '')
             salary_range = job_data.get('salary_range', '') or job_data.get('salaryRange', '')
             application_deadline = job_data.get('application_deadline') or job_data.get('applicationDeadline')
             image = job_data.get('image_url', '') or job_data.get('image', '')
@@ -203,6 +280,7 @@ class Database:
             interview_format = job_data.get('interview_format', '') or job_data.get('interviewFormat', '')
             required_experience = job_data.get('required_experience', '') or job_data.get('requiredExperience', '')
             category_id = job_data.get('category_id') or job_data.get('categoryId') or None
+            category_id = int(category_id) if category_id not in (None, "") else None
             # Use postedById from job_data, fallback to default if not provided
             posted_by_id = job_data.get('postedById') or '35eac158-cf81-4ec0-a523-a061b72eeb5f'
             site_id = job_data.get('siteId', '') or job_data.get('micrositeId', '')
@@ -252,10 +330,19 @@ class Database:
                 try:
                     await conn.execute("""
                         ALTER TABLE "JobPost"
-                        ADD COLUMN IF NOT EXISTS "categoryId" TEXT
+                        ADD COLUMN IF NOT EXISTS "categoryId" INTEGER
                     """)
                 except Exception as e:
                     logger.debug(f"categoryId column check: {str(e)}")
+                try:
+                    await conn.execute("""
+                        ALTER TABLE "JobPost"
+                        ADD COLUMN IF NOT EXISTS city TEXT,
+                        ADD COLUMN IF NOT EXISTS state TEXT,
+                        ADD COLUMN IF NOT EXISTS country TEXT
+                    """)
+                except Exception as e:
+                    logger.debug(f"city/state/country column check: {str(e)}")
                 
                 # Generate a unique ID for the job post
                 post_id = str(uuid.uuid4())
@@ -269,10 +356,10 @@ class Database:
                         "preferredExperience", "educationLevel", "certificationLevel", 
                         "interviewFormat", "postedById", channels, "siteId", 
                         "isScrapped", active, "createdAt", "updatedAt", "source_url", htmlContent,
-                        "requiredExperience", "categoryId"
+                        "requiredExperience", "categoryId", city, state, country
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 
-                        $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28
+                        $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31
                     )
                 """,
                     post_id,  # id
@@ -302,7 +389,10 @@ class Database:
                     source_url,  # source_url
                     html_content,  # html_content
                     required_experience,  # requiredExperience
-                    category_id  # categoryId
+                    category_id,  # categoryId
+                    city,  # city
+                    state,  # state
+                    country  # country
                 )
                 
                 logger.info(f"Successfully inserted job post with ID: {post_id}")

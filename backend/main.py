@@ -1,12 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
+from pydantic import AliasChoices, BaseModel, Field
+from typing import Any, List, Optional
 import asyncio
 import json
 import os
 from dotenv import load_dotenv
 
+from company_profile_scraper import scrape_company_pages
 from job_scraper import JobScraper
 
 load_dotenv()
@@ -70,6 +71,9 @@ class JobData(BaseModel):
     job_id: Optional[str] = None
     job_description: Optional[str] = None
     location: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[Any] = None
+    country: Optional[Any] = None
     salary_range: Optional[str] = None
     application_deadline: Optional[str] = None
     image_url: Optional[str] = None
@@ -91,6 +95,79 @@ class ScrapeResponse(BaseModel):
     message: str
     jobs: List[JobData] = []
     total_jobs: int = 0
+
+class DetectJobCategoryRequest(BaseModel):
+    job_id: str
+
+class DetectJobCategoryResponse(BaseModel):
+    success: bool
+    message: str
+    job_id: str
+    category_id: Optional[str] = None
+    category_name: Optional[str] = None
+    updated: bool = False
+
+class CompanyPagesRequest(BaseModel):
+    home_page_url: str = Field(validation_alias=AliasChoices("home_page_url", "hom_page_url"))
+    contact_us_url: Optional[str] = None
+    about_us_url: str
+
+class CompanySectionData(BaseModel):
+    title: Optional[str] = None
+    image: Optional[str] = None
+    url: Optional[str] = None
+
+class CompanyHomePageData(BaseModel):
+    company_logo: Optional[str] = None
+    company_name: Optional[str] = None
+    hero_image: Optional[str] = None
+    description: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    sections: List[CompanySectionData] = Field(default_factory=list)
+
+class CompanyAboutPageData(BaseModel):
+    images: List[str] = Field(default_factory=list)
+    description: Optional[str] = None
+
+class CompanyContactPersonData(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    telephone: Optional[str] = None
+    fax: Optional[str] = None
+
+class CompanyContactRegionData(BaseModel):
+    name: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    post_code: Optional[str] = None
+    state: Optional[str] = None
+    country: Optional[str] = None
+    telephone: Optional[str] = None
+    phone: Optional[str] = None
+    fax: Optional[str] = None
+    mail: Optional[str] = None
+    contact_person: Optional[CompanyContactPersonData] = None
+
+class CompanyContactPageData(BaseModel):
+    regions: List[CompanyContactRegionData] = Field(default_factory=list)
+
+class CompanyPagesData(BaseModel):
+    home_page: CompanyHomePageData
+    about_us_page: CompanyAboutPageData
+    contact_us_page: CompanyContactPageData
+
+class CompanyPageError(BaseModel):
+    page: str
+    url: str
+    status_code: Optional[int] = None
+    error: str
+
+class CompanyPagesResponse(BaseModel):
+    success: bool
+    message: str
+    data: CompanyPagesData
+    errors: List[CompanyPageError] = Field(default_factory=list)
 
 @app.get("/")
 async def root():
@@ -131,10 +208,11 @@ async def _get_scrape_db_context():
         return {
             "existing_source_urls": await db.get_scraped_source_urls(),
             "categories": await db.get_categories(),
+            "country_and_states": await db.get_country_and_states(),
         }
     except Exception as e:
         print(f"⚠️ Could not load scrape DB context; continuing without DB filters/categories: {e}")
-        return {"existing_source_urls": set(), "categories": []}
+        return {"existing_source_urls": set(), "categories": [], "country_and_states": []}
     finally:
         if db:
             await db.close()
@@ -147,12 +225,14 @@ async def scrape_jobs(request: ScrapeRequest):
         scrape_context = await _get_scrape_db_context()
         existing_source_urls = scrape_context["existing_source_urls"]
         categories = scrape_context["categories"]
+        country_and_states = scrape_context["country_and_states"]
 
         # Initialize the job scraper
         scraper = JobScraper(
             include_html_content=request.include_html_content,
             fast_mode=True,
             categories=categories,
+            country_and_states=country_and_states,
         )
         
         # Scrape jobs from the provided URL (limited by max_jobs)
@@ -167,6 +247,7 @@ async def scrape_jobs(request: ScrapeRequest):
                 include_html_content=request.include_html_content,
                 fast_mode=False,
                 categories=categories,
+                country_and_states=country_and_states,
             )
             fallback_jobs = await fallback_scraper.scrape_jobs(
                 request.url,
@@ -184,7 +265,14 @@ async def scrape_jobs(request: ScrapeRequest):
                 total_jobs=0
             )
         
-        response_jobs = jobs if request.include_html_content else _compact_jobs_for_response(jobs)
+        if request.include_html_content:
+            response_jobs = []
+            for job in jobs:
+                response_job = dict(job)
+                response_job.setdefault("html_content", "")
+                response_jobs.append(response_job)
+        else:
+            response_jobs = _compact_jobs_for_response(jobs)
 
         return ScrapeResponse(
             success=True,
@@ -195,6 +283,75 @@ async def scrape_jobs(request: ScrapeRequest):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Scraping failed: {str(e)}")
+
+@app.post("/detect-job-category", response_model=DetectJobCategoryResponse, response_model_exclude_none=True)
+async def detect_job_category(request: DetectJobCategoryRequest):
+    db = None
+    try:
+        from database import Database
+
+        db = Database()
+        await db.connect()
+        job_post = await db.get_job_post_by_id(request.job_id)
+        if not job_post:
+            raise HTTPException(status_code=404, detail=f"JobPost not found for id: {request.job_id}")
+
+        categories = await db.get_categories()
+        scraper = JobScraper(
+            include_html_content=False,
+            fast_mode=True,
+            categories=categories,
+        )
+        detected = await scraper.detect_child_category_for_job(job_post)
+        category_id = detected.get("category_id") or ""
+        category_name = detected.get("category_name") or ""
+        updated = False
+        if category_id:
+            updated = await db.update_job_post_category(request.job_id, category_id)
+
+        return DetectJobCategoryResponse(
+            success=bool(category_id and updated),
+            message=(
+                "Successfully detected child category and updated JobPost"
+                if category_id and updated
+                else "Detected child category but failed to update JobPost"
+                if category_id
+                else "No matching child category detected"
+            ),
+            job_id=request.job_id,
+            category_id=category_id,
+            category_name=category_name,
+            updated=updated,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Job category detection failed: {str(e)}")
+    finally:
+        if db:
+            await db.close()
+
+@app.post("/scrape-company-pages", response_model=CompanyPagesResponse)
+async def scrape_company_pages_endpoint(request: CompanyPagesRequest):
+    try:
+        data = await scrape_company_pages(
+            home_page_url=request.home_page_url,
+            contact_us_url=request.contact_us_url,
+            about_us_url=request.about_us_url,
+        )
+        errors = data.pop("errors", [])
+        return CompanyPagesResponse(
+            success=True,
+            message=(
+                "Scraped company pages with page fetch errors"
+                if errors
+                else "Successfully scraped company pages"
+            ),
+            data=data,
+            errors=errors,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Company page scraping failed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
