@@ -364,16 +364,46 @@ class JobScraper:
     def _category_id(self, category: Dict) -> str:
         for key in ("id", "categoryId", "category_id", "value", "uuid"):
             value = category.get(key)
-            if value:
+            if value not in (None, ""):
                 return str(value)
         return ""
 
     def _category_parent_id(self, category: Dict) -> str:
         for key in ("parent_category_id", "parentCategoryId", "parent_id", "parentId", "parent"):
-            value = category.get(key)
-            if value:
-                return str(value)
+            if key in category:
+                value = category.get(key)
+                if value not in (None, ""):
+                    return str(value)
+                return ""
         return ""
+
+    def _category_has_parent(self, category: Dict) -> bool:
+        for key in ("parent_category_id", "parentCategoryId", "parent_id", "parentId", "parent"):
+            if key in category:
+                value = category.get(key)
+                return value not in (None, "")
+        return False
+
+    def _is_other_category(self, category: Dict) -> bool:
+        return self._category_name(category).strip().lower() in ("other", "others")
+
+    def _category_is_active(self, category: Dict) -> bool:
+        for key in ("active", "isActive", "enabled", "isEnabled"):
+            if key in category:
+                value = category.get(key)
+                if isinstance(value, str):
+                    return value.strip().lower() not in ("false", "0", "no", "disabled")
+                return bool(value)
+        return True
+
+    def _category_is_selectable_child(self, category: Dict) -> bool:
+        if not self._category_id(category) or not self._category_is_active(category):
+            return False
+        return self._category_has_parent(category)
+
+    def _category_sort_key(self, category: Dict) -> Tuple[int, str]:
+        # Keep "Other" visible in the candidate list but place it last.
+        return (1 if self._is_other_category(category) else 0, self._category_name(category).lower())
 
     def _category_name(self, category: Dict) -> str:
         for key in ("name", "title", "label", "category", "categoryName", "displayName", "slug"):
@@ -390,17 +420,24 @@ class JobScraper:
         if not self.categories:
             return []
 
-        child_categories = [
+        child_categories = sorted([
             category
             for category in self.categories
-            if self._category_id(category) and self._category_parent_id(category)
-        ]
+            if self._category_is_selectable_child(category)
+        ], key=self._category_sort_key)
 
         # If the table has tree data, only child rows are valid choices.
         if child_categories:
             return child_categories
 
-        return self.categories
+        return sorted(
+            [
+                category
+                for category in self.categories
+                if self._category_id(category) and self._category_is_active(category)
+            ],
+            key=self._category_sort_key,
+        )
 
     def _category_parent_name(self, category: Dict) -> str:
         parent_id = self._category_parent_id(category)
@@ -410,6 +447,46 @@ class JobScraper:
             if self._category_id(possible_parent) == parent_id:
                 return self._category_name(possible_parent)
         return ""
+
+    def _other_category(self, categories: Optional[List[Dict]] = None) -> Optional[Dict]:
+        categories = categories if categories is not None else self._selectable_categories()
+        for category in categories:
+            category_name = self._category_name(category).strip().lower()
+            if category_name in ("other", "others"):
+                return category
+        return None
+
+    def _named_category(self, names: Tuple[str, ...], categories: Optional[List[Dict]] = None) -> Optional[Dict]:
+        categories = categories if categories is not None else self._selectable_categories()
+        wanted = {name.strip().lower() for name in names}
+        for category in categories:
+            if self._category_name(category).strip().lower() in wanted:
+                return category
+        return None
+
+    def _is_low_information_test_job(self, job_data: Dict) -> bool:
+        text = " ".join(str(job_data.get(key, "")) for key in (
+            "job_title",
+            "job_description",
+            "key_responsibilities",
+            "qualifications_and_skills",
+            "required_experience",
+            "educational_level",
+            "certification_level",
+        )).lower()
+        tokens = re.findall(r"[a-z0-9]+", text)
+        if not tokens:
+            return False
+        noise_tokens = {
+            "test", "testing", "tester", "sample", "dummy", "demo", "example",
+            "asdf", "n/a", "na", "none", "null", "content", "title", "job",
+        }
+        meaningful_tokens = [token for token in tokens if token not in ("job", "title", "content")]
+        if len(tokens) <= 8 and all(token in noise_tokens for token in tokens):
+            return True
+        return bool(meaningful_tokens) and len(meaningful_tokens) <= 4 and all(
+            token in noise_tokens for token in meaningful_tokens
+        )
 
     def _format_categories_for_prompt(self) -> str:
         selectable_categories = self._selectable_categories()
@@ -423,7 +500,13 @@ class JobScraper:
                 parent_name = self._category_parent_name(category)
                 parent_part = f"; parent: {parent_name}" if parent_name else ""
                 lines.append(f"- id: {category_id}; name: {category_name}{parent_part}")
-        return "\n".join(lines) if lines else "No child/leaf categories were provided. Return null for category_id and category_name."
+        if not lines:
+            return "No child/leaf categories were provided. Return null for category_id and category_name."
+        other_category = self._other_category(selectable_categories)
+        suffix = ""
+        if other_category:
+            suffix = "\n\nOther is a valid child category candidate. Use Other when no specific child category matches."
+        return "\n".join(lines) + suffix
 
     def _normalize_extracted_category(self, job_data: Dict) -> None:
         selectable_categories = self._selectable_categories()
@@ -434,6 +517,16 @@ class JobScraper:
 
         extracted_id = (job_data.get("category_id") or "").strip().lower()
         extracted_name = (job_data.get("category_name") or job_data.get("category") or "").strip().lower()
+
+        if self._is_low_information_test_job(job_data):
+            fallback_category = (
+                self._named_category(("test", "testing"), selectable_categories)
+                or self._other_category(selectable_categories)
+            )
+            if fallback_category:
+                job_data["category_id"] = self._category_id(fallback_category)
+                job_data["category_name"] = self._category_name(fallback_category)
+                return
 
         for category in selectable_categories:
             category_id = self._category_id(category)
@@ -463,6 +556,12 @@ class JobScraper:
                 job_data["category_id"] = self._category_id(category)
                 job_data["category_name"] = category_name
                 return
+
+        other_category = self._other_category(selectable_categories)
+        if other_category:
+            job_data["category_id"] = self._category_id(other_category)
+            job_data["category_name"] = self._category_name(other_category)
+            return
 
         job_data["category_id"] = ""
         job_data["category_name"] = ""
@@ -510,7 +609,7 @@ class JobScraper:
         Job content:
         {job_text}
 
-        Return the single best matching child/leaf category. Do not invent a category.
+        Return the single best matching child/leaf category. If the job is only test/dummy/sample content, return the child category named Test when it exists; otherwise return Other. If no child category matches this job, return the child category named Other. Do not invent a category.
         """
 
         try:
@@ -591,6 +690,55 @@ class JobScraper:
             driver.quit()
         except Exception as e:
             print(f"⚠️ driver.quit() (ignored): {e}")
+
+    def _accept_cookie_banner_if_present(self, driver) -> None:
+        """Click common cookie accept controls before capturing rendered detail HTML."""
+        try:
+            clicked = driver.execute_script(
+                """
+                const selectors = [
+                    '#CookiePolicyBarButton',
+                    'button[id*="CookiePolicyBarButton" i]',
+                    'button[id*="cookie"][id*="accept" i]',
+                    'button[class*="cookie"][class*="accept" i]',
+                    'button[aria-label*="accept" i]',
+                    'a[id*="cookie"][id*="accept" i]',
+                    'a[class*="cookie"][class*="accept" i]'
+                ];
+                function visible(el) {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && Number(style.opacity || 1) > 0
+                        && rect.width > 0
+                        && rect.height > 0;
+                }
+                for (const selector of selectors) {
+                    for (const el of document.querySelectorAll(selector)) {
+                        const text = (el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                        if (visible(el) && /accept|continue|agree|allow/.test(text)) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                }
+                for (const el of document.querySelectorAll('button, a, input[type="button"], input[type="submit"]')) {
+                    const text = (el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    if (visible(el) && /^(accept(\\s*&\\s*continue)?|accept and continue|agree|allow all|ok)$/i.test(text)) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+                """
+            )
+            if clicked:
+                print("🍪 Accepted cookie banner")
+                time.sleep(0.5)
+        except Exception as e:
+            print(f"⚠️ Cookie accept click skipped: {e}")
     
     def _setup_selenium_driver(self):
         """Setup Chrome WebDriver with proper options"""
@@ -2051,6 +2199,10 @@ class JobScraper:
             r"(similar|related|recommended)[\s_-]*jobs?|jobs[\s_-]*you[\s_-]*may[\s_-]*like|all[\s_-]*jobs",
             re.I,
         )
+        cookie_attr_re = re.compile(
+            r"cookie(?:policy|banner|bar|consent|notice|wrapper)?|CookiePolicyBar|CookiePolicyBarWrapper|CookiePolicyBarButton",
+            re.I,
+        )
         apply_attr_re = re.compile(
             r"(?:^|[\s_-])(social[\s_-]*apply|dialogapplybtn|applyoption|applylistitemoption|"
             r"apply[\s_-]*(?:button|btn|container|link|option)|btn[\s_-]*social[\s_-]*apply)(?:$|[\s_-])|"
@@ -2081,6 +2233,19 @@ class JobScraper:
                     parts.append(str(value))
             return " ".join(parts)
 
+        def is_inline_hidden(el) -> bool:
+            style = str(el.get("style") or "").lower()
+            if not style:
+                return False
+            hidden_patterns = (
+                r"display\s*:\s*none",
+                r"visibility\s*:\s*hidden",
+                r"opacity\s*:\s*0(?:\.0+)?(?:\s*;|$)",
+                r"(?:^|;)\s*width\s*:\s*0(?:px|em|rem|%)?",
+                r"(?:^|;)\s*height\s*:\s*0(?:px|em|rem|%)?",
+            )
+            return any(re.search(pattern, style) for pattern in hidden_patterns)
+
         for element in list(soup.find_all(True)):
             if not getattr(element, "parent", None):
                 continue
@@ -2089,6 +2254,12 @@ class JobScraper:
                 element.decompose()
                 continue
             attrs = element_attr_text(element)
+            if cookie_attr_re.search(attrs):
+                element.decompose()
+                continue
+            if is_inline_hidden(element):
+                element.decompose()
+                continue
             if apply_attr_re.search(attrs):
                 block = self._select_apply_block(element)
                 block.decompose()
@@ -2224,6 +2395,7 @@ class JobScraper:
             try:
                 driver = self._setup_selenium_driver()
                 self._selenium_navigate(driver, base_url)
+                self._accept_cookie_banner_if_present(driver)
                 
                 # Keep this close to the original working renderer: let the detail
                 # page settle, then scroll once so lazy sections compute their styles.
@@ -2422,16 +2594,39 @@ class JobScraper:
                     function shouldRemoveElement(element) {
                         const id = element.getAttribute('id') || '';
                         const className = element.getAttribute('class') || '';
+                        const role = element.getAttribute('role') || '';
+                        const aria = element.getAttribute('aria-label') || '';
                         const idLower = id.toLowerCase();
                         const classLower = className.toLowerCase();
-                        return idLower.includes('search') || classLower.includes('search');
+                        const attrText = [idLower, classLower, role.toLowerCase(), aria.toLowerCase()].join(' ');
+                        return idLower.includes('search') || classLower.includes('search')
+                            || /cookie(policy|banner|bar|consent|notice|wrapper)?/.test(attrText)
+                            || id === 'CookiePolicyBarWrapper'
+                            || id === 'CookiePolicyBar'
+                            || id === 'CookiePolicyBarButton';
+                    }
+
+                    function shouldRemoveRenderedElement(element) {
+                        if (!element || element === document.body || element === document.documentElement) {
+                            return false;
+                        }
+                        const tag = (element.tagName || '').toLowerCase();
+                        if (tag === 'script' || tag === 'style' || tag === 'noscript') {
+                            return true;
+                        }
+                        const style = window.getComputedStyle(element);
+                        if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) === 0) {
+                            return true;
+                        }
+                        const rect = element.getBoundingClientRect();
+                        return rect.width === 0 || rect.height === 0;
                     }
                     
                     // Remove matching elements
                     const allElements = document.querySelectorAll('*');
                     const elementsToRemove = [];
                     allElements.forEach(el => {
-                        if (hasHeaderFooter(el) || shouldRemoveElement(el)) {
+                        if (hasHeaderFooter(el) || shouldRemoveElement(el) || shouldRemoveRenderedElement(el)) {
                             elementsToRemove.push(el);
                         }
                     });
@@ -2967,7 +3162,7 @@ class JobScraper:
         
         Return only valid JSON. If a field is not found, use null as the value.
         Normalize location to city/town, province/state, country. If the source page omits country, infer it from the province/state or city when obvious. If the source page omits province/state, infer it from the city when obvious.
-        For category_id and category_name, choose the single best matching child/leaf category from the category list. Do not invent a category and do not return a parent category.
+        For category_id and category_name, choose the single best matching child/leaf category from the category list. If the job is only test/dummy/sample content, return the child category named Test when it exists; otherwise return Other. If no child category matches this job, return the child category named Other. Do not invent a category and do not return a parent category.
         """
         
         try:
